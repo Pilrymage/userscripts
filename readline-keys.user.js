@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Readline 键位（网页输入框）
 // @namespace    https://github.com/Pilrymage/userscripts
-// @version      1.2.0
-// @description  在网页输入框 / textarea / contenteditable 中启用 Bash readline 风格的 Ctrl 键：A E P N F B K D，以及 Alt+D 删除到词尾。
+// @version      1.3.0
+// @description  在网页输入框 / textarea / contenteditable 中启用 Bash readline / Emacs 风格按键：Ctrl+A E P N F B K D，Alt+F B D Backspace（中文按词），Alt+< > 跳到文本开头/结尾。
 // @author       Pilrymage
 // @license      MIT
 // @homepageURL  https://github.com/Pilrymage/userscripts
@@ -19,12 +19,24 @@
   // 自带按键处理的代码编辑器（隐藏 textarea 方案），交给它们自己处理
   const SKIP_SELECTOR = '.monaco-editor, .CodeMirror, .ace_editor';
   const TEXT_INPUT_TYPES = new Set(['text', 'search', 'url', 'tel', 'password']);
-  const KEYS = new Set(['KeyA', 'KeyE', 'KeyP', 'KeyN', 'KeyF', 'KeyB', 'KeyK', 'KeyD']);
+  const CTRL_KEYS = new Set(['KeyA', 'KeyE', 'KeyP', 'KeyN', 'KeyF', 'KeyB', 'KeyK', 'KeyD']);
+  const ALT_KEYS = { KeyF: 'AltF', KeyB: 'AltB', KeyD: 'AltD', Backspace: 'AltBackspace' };
 
   let goalColumn = null; // 连续 P/N 时保持列
 
+  function getAction(e) {
+    if (e.metaKey || e.isComposing) return null;
+    if (e.ctrlKey && !e.altKey && !e.shiftKey && CTRL_KEYS.has(e.code)) return e.code;
+    if (e.altKey && !e.ctrlKey) { // AltGr 是 Ctrl+Alt，不会命中
+      if (e.key === '<') return 'AltLt'; // Alt+Shift+,
+      if (e.key === '>') return 'AltGt'; // Alt+Shift+.
+      if (!e.shiftKey && ALT_KEYS[e.code]) return ALT_KEYS[e.code];
+    }
+    return null;
+  }
+
   function getTarget(e) {
-    let el = e.composedPath ? e.composedPath()[0] : e.target;
+    const el = e.composedPath ? e.composedPath()[0] : e.target;
     if (!(el instanceof Element)) return null;
     if (el.closest(SKIP_SELECTOR)) return null;
     if (el instanceof HTMLTextAreaElement) return el.readOnly || el.disabled ? null : { kind: 'field', el, multiline: true };
@@ -36,7 +48,7 @@
     return null;
   }
 
-  // ---------- input / textarea ----------
+  // ---------- 文本工具 ----------
   const isHigh = (c) => c >= 0xd800 && c <= 0xdbff;
   const isLow = (c) => c >= 0xdc00 && c <= 0xdfff;
   const nextPos = (v, p) => Math.min(v.length, p + (isHigh(v.charCodeAt(p)) && isLow(v.charCodeAt(p + 1)) ? 2 : 1));
@@ -44,29 +56,44 @@
   const lineStart = (v, p) => v.lastIndexOf('\n', p - 1) + 1;
   const lineEnd = (v, p) => { const i = v.indexOf('\n', p); return i < 0 ? v.length : i; };
 
-  // 从 p 开始到下一个词的词尾（readline M-d 语义）；中文按 Intl.Segmenter 分词。找不到返回 -1
+  // 中文等用 Intl.Segmenter 分词；找不到词返回 -1
+  const WINDOW = 4000;
   const segmenter = typeof Intl.Segmenter === 'function' ? new Intl.Segmenter(undefined, { granularity: 'word' }) : null;
+
+  // p 之后下一个词的词尾（readline forward-word / kill-word）
   function wordEnd(text, p) {
-    const chunk = text.slice(p, p + 4000);
+    const chunk = text.slice(p, p + WINDOW);
     if (segmenter) {
-      for (const s of segmenter.segment(chunk)) {
-        if (s.isWordLike) return p + s.index + s.segment.length;
-      }
+      for (const s of segmenter.segment(chunk)) if (s.isWordLike) return p + s.index + s.segment.length;
       return -1;
     }
     const m = /[^\p{L}\p{N}_]*[\p{L}\p{N}_]+/u.exec(chunk);
     return m ? p + m[0].length : -1;
   }
 
-  function moveTo(el, p) { el.setSelectionRange(p, p); }
+  // p 之前上一个词的词首（readline backward-word / backward-kill-word）
+  function wordStart(text, p) {
+    const from = Math.max(0, p - WINDOW);
+    const chunk = text.slice(from, p);
+    if (segmenter) {
+      let start = -1;
+      for (const s of segmenter.segment(chunk)) if (s.isWordLike) start = from + s.index;
+      return start;
+    }
+    const m = /[\p{L}\p{N}_]+[^\p{L}\p{N}_]*$/u.exec(chunk);
+    return m ? from + m.index : -1;
+  }
 
-  // Ctrl+K 删掉的内容写入系统剪贴板
+  // 删除的内容写入系统剪贴板
   function copyKill(text) {
     if (!text) return;
     try { GM_setClipboard(text, 'text'); } catch (_) {
       navigator.clipboard && navigator.clipboard.writeText(text).catch(() => {});
     }
   }
+
+  // ---------- input / textarea ----------
+  function moveTo(el, p) { el.setSelectionRange(p, p); }
 
   function deleteRange(el, from, to, copy) {
     if (from >= to) return;
@@ -75,18 +102,18 @@
     // execCommand 保留撤销栈，并触发 input 事件让 React/Vue 同步
     if (!document.execCommand('delete')) {
       el.setRangeText('', from, to, 'start');
-      el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentForward' }));
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContent' }));
     }
   }
 
-  function handleField(code, el, multiline) {
+  function handleField(action, el, multiline) {
     const v = el.value;
     const p = el.selectionDirection === 'backward' ? el.selectionStart : el.selectionEnd;
     const ls = lineStart(v, p);
     const le = lineEnd(v, p);
-    if (code !== 'KeyP' && code !== 'KeyN') goalColumn = null;
+    if (action !== 'KeyP' && action !== 'KeyN') goalColumn = null;
 
-    switch (code) {
+    switch (action) {
       case 'KeyA': moveTo(el, ls); break;
       case 'KeyE': moveTo(el, le); break;
       case 'KeyF': moveTo(el, nextPos(v, p)); break;
@@ -95,7 +122,7 @@
       case 'KeyN': {
         if (!multiline) break;
         if (goalColumn === null) goalColumn = p - ls;
-        if (code === 'KeyP') {
+        if (action === 'KeyP') {
           if (ls === 0) { moveTo(el, 0); break; }
           const pls = lineStart(v, ls - 1);
           moveTo(el, Math.min(pls + goalColumn, ls - 1));
@@ -107,63 +134,97 @@
         break;
       }
       case 'KeyK': deleteRange(el, p, le === p ? nextPos(v, p) : le, true); break;
-      case 'AltD': {
-        const we = wordEnd(v, p);
-        deleteRange(el, p, we < 0 ? v.length : we, true);
-        break;
-      }
       case 'KeyD':
         if (el.selectionStart !== el.selectionEnd) deleteRange(el, el.selectionStart, el.selectionEnd);
         else deleteRange(el, p, nextPos(v, p));
         break;
+      case 'AltF': { const we = wordEnd(v, p); moveTo(el, we < 0 ? v.length : we); break; }
+      case 'AltB': { const ws = wordStart(v, p); moveTo(el, ws < 0 ? 0 : ws); break; }
+      case 'AltD': { const we = wordEnd(v, p); deleteRange(el, p, we < 0 ? v.length : we, true); break; }
+      case 'AltBackspace': { const ws = wordStart(v, p); deleteRange(el, ws < 0 ? 0 : ws, p, true); break; }
+      case 'AltLt': moveTo(el, 0); el.scrollTop = 0; break;
+      case 'AltGt': moveTo(el, v.length); el.scrollTop = el.scrollHeight; break;
     }
   }
 
   // ---------- contenteditable ----------
-  function handleRich(code) {
+  function editingHost(el) {
+    while (el.parentElement && el.parentElement.isContentEditable) el = el.parentElement;
+    return el;
+  }
+
+  function scrollCaretIntoView(sel) {
+    const n = sel.focusNode;
+    const target = n && (n.nodeType === Node.TEXT_NODE ? n.parentElement : n);
+    if (target && target.scrollIntoView) target.scrollIntoView({ block: 'nearest' });
+  }
+
+  function handleRich(action, el) {
     const sel = window.getSelection();
     if (!sel || !sel.rangeCount) return;
-    const move = (dir, unit) => {
-      if (!sel.isCollapsed) sel.collapseToEnd();
-      sel.modify('move', dir, unit);
-    };
-    switch (code) {
-      case 'KeyA': move('backward', 'lineboundary'); break;
-      case 'KeyE': move('forward', 'lineboundary'); break;
-      case 'KeyF': move('forward', 'character'); break;
-      case 'KeyB': move('backward', 'character'); break;
-      case 'KeyP': move('backward', 'line'); break;
-      case 'KeyN': move('forward', 'line'); break;
+    // readline 没有选区概念：先收拢到光标所在端
+    if (!sel.isCollapsed && action !== 'KeyD') sel.collapse(sel.focusNode, sel.focusOffset);
+    const node = sel.focusNode, off = sel.focusOffset;
+    const text = node && node.nodeType === Node.TEXT_NODE ? node.data : null;
+    const kill = () => { if (!sel.isCollapsed) { copyKill(sel.toString()); document.execCommand('delete'); } };
+
+    switch (action) {
+      case 'KeyA': sel.modify('move', 'backward', 'lineboundary'); break;
+      case 'KeyE': sel.modify('move', 'forward', 'lineboundary'); break;
+      case 'KeyF': sel.modify('move', 'forward', 'character'); break;
+      case 'KeyB': sel.modify('move', 'backward', 'character'); break;
+      case 'KeyP': sel.modify('move', 'backward', 'line'); break;
+      case 'KeyN': sel.modify('move', 'forward', 'line'); break;
       case 'KeyK':
-        if (!sel.isCollapsed) sel.collapseToEnd();
         sel.modify('extend', 'forward', 'lineboundary');
         if (sel.isCollapsed) sel.modify('extend', 'forward', 'character');
-        if (!sel.isCollapsed) { copyKill(sel.toString()); document.execCommand('delete'); }
+        kill();
         break;
       case 'KeyD': document.execCommand('forwardDelete'); break;
+      // 词操作：优先在当前文本节点内分词；跨节点时交给浏览器的按词移动
+      case 'AltF': {
+        const we = text !== null ? wordEnd(text, off) : -1;
+        if (we > off) sel.collapse(node, we); else sel.modify('move', 'forward', 'word');
+        break;
+      }
+      case 'AltB': {
+        const ws = text !== null ? wordStart(text, off) : -1;
+        if (ws >= 0 && ws < off) sel.collapse(node, ws); else sel.modify('move', 'backward', 'word');
+        break;
+      }
       case 'AltD': {
-        if (!sel.isCollapsed) sel.collapseToEnd();
-        const node = sel.focusNode, off = sel.focusOffset;
-        const we = node && node.nodeType === Node.TEXT_NODE ? wordEnd(node.data, off) : -1;
-        if (we > off) sel.setBaseAndExtent(node, off, node, we);
-        else sel.modify('extend', 'forward', 'word'); // 词在后面的节点里，交给浏览器
-        if (!sel.isCollapsed) { copyKill(sel.toString()); document.execCommand('delete'); }
+        const we = text !== null ? wordEnd(text, off) : -1;
+        if (we > off) sel.setBaseAndExtent(node, off, node, we); else sel.modify('extend', 'forward', 'word');
+        kill();
+        break;
+      }
+      case 'AltBackspace': {
+        const ws = text !== null ? wordStart(text, off) : -1;
+        if (ws >= 0 && ws < off) sel.setBaseAndExtent(node, off, node, ws); else sel.modify('extend', 'backward', 'word');
+        kill();
+        break;
+      }
+      case 'AltLt':
+      case 'AltGt': {
+        const range = document.createRange();
+        range.selectNodeContents(editingHost(el));
+        range.collapse(action === 'AltLt');
+        sel.removeAllRanges();
+        sel.addRange(range);
+        scrollCaretIntoView(sel);
         break;
       }
     }
   }
 
   window.addEventListener('keydown', (e) => {
-    if (e.shiftKey || e.metaKey || e.isComposing) return;
-    let action;
-    if (e.ctrlKey && !e.altKey && KEYS.has(e.code)) action = e.code;
-    else if (e.altKey && !e.ctrlKey && e.code === 'KeyD') action = 'AltD'; // AltGr 是 Ctrl+Alt，不会命中
-    else return;
+    const action = getAction(e);
+    if (!action) return;
     const t = getTarget(e);
     if (!t) return;
     e.preventDefault();
     e.stopImmediatePropagation();
     if (t.kind === 'field') handleField(action, t.el, t.multiline);
-    else { goalColumn = null; handleRich(action); }
+    else { goalColumn = null; handleRich(action, t.el); }
   }, true);
 })();
