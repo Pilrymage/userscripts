@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Readline 键位（网页输入框）
 // @namespace    https://github.com/Pilrymage/userscripts
-// @version      1.3.0
-// @description  在网页输入框 / textarea / contenteditable 中启用 Bash readline / Emacs 风格按键：Ctrl+A E P N F B K D，Alt+F B D Backspace（中文按词），Alt+< > 跳到文本开头/结尾。
+// @version      1.4.0
+// @description  在网页输入框 / textarea / contenteditable 中启用 Bash readline / Emacs 风格按键：Ctrl+A E P N F B K D，Ctrl+J 换行，Alt+F B D Backspace（中文按词），Alt+< > 跳到文本开头/结尾。
 // @author       Pilrymage
 // @license      MIT
 // @homepageURL  https://github.com/Pilrymage/userscripts
@@ -19,7 +19,7 @@
   // 自带按键处理的代码编辑器（隐藏 textarea 方案），交给它们自己处理
   const SKIP_SELECTOR = '.monaco-editor, .CodeMirror, .ace_editor';
   const TEXT_INPUT_TYPES = new Set(['text', 'search', 'url', 'tel', 'password']);
-  const CTRL_KEYS = new Set(['KeyA', 'KeyE', 'KeyP', 'KeyN', 'KeyF', 'KeyB', 'KeyK', 'KeyD']);
+  const CTRL_KEYS = new Set(['KeyA', 'KeyE', 'KeyP', 'KeyN', 'KeyF', 'KeyB', 'KeyK', 'KeyD', 'KeyJ']);
   const ALT_KEYS = { KeyF: 'AltF', KeyB: 'AltB', KeyD: 'AltD', Backspace: 'AltBackspace' };
 
   let goalColumn = null; // 连续 P/N 时保持列
@@ -138,6 +138,13 @@
         if (el.selectionStart !== el.selectionEnd) deleteRange(el, el.selectionStart, el.selectionEnd);
         else deleteRange(el, p, nextPos(v, p));
         break;
+      case 'KeyJ':
+        // 直接插入换行，不经过页面的 Enter 处理（不会误发送）
+        if (multiline && !document.execCommand('insertText', false, '\n')) {
+          el.setRangeText('\n', el.selectionStart, el.selectionEnd, 'end');
+          el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertLineBreak' }));
+        }
+        break;
       case 'AltF': { const we = wordEnd(v, p); moveTo(el, we < 0 ? v.length : we); break; }
       case 'AltB': { const ws = wordStart(v, p); moveTo(el, ws < 0 ? 0 : ws); break; }
       case 'AltD': { const we = wordEnd(v, p); deleteRange(el, p, we < 0 ? v.length : we, true); break; }
@@ -157,6 +164,18 @@
     const n = sel.focusNode;
     const target = n && (n.nodeType === Node.TEXT_NODE ? n.parentElement : n);
     if (target && target.scrollIntoView) target.scrollIntoView({ block: 'nearest' });
+  }
+
+  // 富文本编辑器（ProseMirror、Lexical、Quill 等）自己维护文档模型，直接改 DOM 不可靠。
+  // 先模拟一次 Shift+Enter（各家聊天框通用的换行键），页面处理了就会 preventDefault；
+  // 没人处理时再用 execCommand 兜底。
+  function insertRichNewline(el) {
+    const init = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, shiftKey: true, bubbles: true, cancelable: true, composed: true };
+    const down = new KeyboardEvent('keydown', init);
+    const handled = !el.dispatchEvent(down);
+    el.dispatchEvent(new KeyboardEvent('keyup', init));
+    if (handled) return;
+    if (!document.execCommand('insertLineBreak')) document.execCommand('insertParagraph');
   }
 
   function handleRich(action, el) {
@@ -181,6 +200,7 @@
         kill();
         break;
       case 'KeyD': document.execCommand('forwardDelete'); break;
+      case 'KeyJ': insertRichNewline(el); break;
       // 词操作：优先在当前文本节点内分词；跨节点时交给浏览器的按词移动
       case 'AltF': {
         const we = text !== null ? wordEnd(text, off) : -1;
