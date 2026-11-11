@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Readline 键位（网页输入框）
 // @namespace    https://github.com/Pilrymage/userscripts
-// @version      1.1.0
-// @description  在网页输入框 / textarea / contenteditable 中启用 Bash readline 风格的 Ctrl 键：A E P N F B K D。
+// @version      1.2.0
+// @description  在网页输入框 / textarea / contenteditable 中启用 Bash readline 风格的 Ctrl 键：A E P N F B K D，以及 Alt+D 删除到词尾。
 // @author       Pilrymage
 // @license      MIT
 // @homepageURL  https://github.com/Pilrymage/userscripts
@@ -43,6 +43,20 @@
   const prevPos = (v, p) => Math.max(0, p - (isLow(v.charCodeAt(p - 1)) && isHigh(v.charCodeAt(p - 2)) ? 2 : 1));
   const lineStart = (v, p) => v.lastIndexOf('\n', p - 1) + 1;
   const lineEnd = (v, p) => { const i = v.indexOf('\n', p); return i < 0 ? v.length : i; };
+
+  // 从 p 开始到下一个词的词尾（readline M-d 语义）；中文按 Intl.Segmenter 分词。找不到返回 -1
+  const segmenter = typeof Intl.Segmenter === 'function' ? new Intl.Segmenter(undefined, { granularity: 'word' }) : null;
+  function wordEnd(text, p) {
+    const chunk = text.slice(p, p + 4000);
+    if (segmenter) {
+      for (const s of segmenter.segment(chunk)) {
+        if (s.isWordLike) return p + s.index + s.segment.length;
+      }
+      return -1;
+    }
+    const m = /[^\p{L}\p{N}_]*[\p{L}\p{N}_]+/u.exec(chunk);
+    return m ? p + m[0].length : -1;
+  }
 
   function moveTo(el, p) { el.setSelectionRange(p, p); }
 
@@ -93,6 +107,11 @@
         break;
       }
       case 'KeyK': deleteRange(el, p, le === p ? nextPos(v, p) : le, true); break;
+      case 'AltD': {
+        const we = wordEnd(v, p);
+        deleteRange(el, p, we < 0 ? v.length : we, true);
+        break;
+      }
       case 'KeyD':
         if (el.selectionStart !== el.selectionEnd) deleteRange(el, el.selectionStart, el.selectionEnd);
         else deleteRange(el, p, nextPos(v, p));
@@ -122,17 +141,29 @@
         if (!sel.isCollapsed) { copyKill(sel.toString()); document.execCommand('delete'); }
         break;
       case 'KeyD': document.execCommand('forwardDelete'); break;
+      case 'AltD': {
+        if (!sel.isCollapsed) sel.collapseToEnd();
+        const node = sel.focusNode, off = sel.focusOffset;
+        const we = node && node.nodeType === Node.TEXT_NODE ? wordEnd(node.data, off) : -1;
+        if (we > off) sel.setBaseAndExtent(node, off, node, we);
+        else sel.modify('extend', 'forward', 'word'); // 词在后面的节点里，交给浏览器
+        if (!sel.isCollapsed) { copyKill(sel.toString()); document.execCommand('delete'); }
+        break;
+      }
     }
   }
 
   window.addEventListener('keydown', (e) => {
-    if (!e.ctrlKey || e.altKey || e.shiftKey || e.metaKey || e.isComposing) return;
-    if (!KEYS.has(e.code)) return;
+    if (e.shiftKey || e.metaKey || e.isComposing) return;
+    let action;
+    if (e.ctrlKey && !e.altKey && KEYS.has(e.code)) action = e.code;
+    else if (e.altKey && !e.ctrlKey && e.code === 'KeyD') action = 'AltD'; // AltGr 是 Ctrl+Alt，不会命中
+    else return;
     const t = getTarget(e);
     if (!t) return;
     e.preventDefault();
     e.stopImmediatePropagation();
-    if (t.kind === 'field') handleField(e.code, t.el, t.multiline);
-    else { goalColumn = null; handleRich(e.code); }
+    if (t.kind === 'field') handleField(action, t.el, t.multiline);
+    else { goalColumn = null; handleRich(action); }
   }, true);
 })();

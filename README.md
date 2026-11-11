@@ -4,7 +4,7 @@
 
 | 脚本 | 说明 | 安装 |
 |---|---|---|
-| Readline 键位 | 网页输入框里的 Bash readline 风格 Ctrl 键：A E P N F B K D（Ctrl+K 删除的内容会写入剪贴板） | [install](https://raw.githubusercontent.com/Pilrymage/userscripts/main/readline-keys.user.js) |
+| Readline 键位 | 网页输入框里的 Bash readline 风格 Ctrl 键：A E P N F B K D，Alt+D 删到词尾（Ctrl+K / Alt+D 删除的内容会写入剪贴板） | [install](https://raw.githubusercontent.com/Pilrymage/userscripts/main/readline-keys.user.js) |
 | NotebookLM 输入框加高 | 加高输入框、提示词菜单、加宽对话区等 | [install](https://raw.githubusercontent.com/Pilrymage/userscripts/main/notebooklm-taller-input.user.js) |
 
 ## Firefox：释放 Ctrl+N
