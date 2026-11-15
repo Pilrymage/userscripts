@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Readline 键位（网页输入框）
 // @namespace    https://github.com/Pilrymage/userscripts
-// @version      1.4.0
-// @description  在网页输入框 / textarea / contenteditable 中启用 Bash readline / Emacs 风格按键：Ctrl+A E P N F B K D，Ctrl+J 换行，Alt+F B D Backspace（中文按词），Alt+< > 跳到文本开头/结尾。
+// @version      1.4.1
+// @description  在网页输入框 / textarea / contenteditable 中启用 Bash readline / Emacs 风格按键：Ctrl+A E P N F B K D，Ctrl+J 换行，Alt+F B D Backspace（中文按词，标点单独停），Alt+< > 跳到文本开头/结尾。
 // @author       Pilrymage
 // @license      MIT
 // @homepageURL  https://github.com/Pilrymage/userscripts
@@ -56,32 +56,64 @@
   const lineStart = (v, p) => v.lastIndexOf('\n', p - 1) + 1;
   const lineEnd = (v, p) => { const i = v.indexOf('\n', p); return i < 0 ? v.length : i; };
 
-  // 中文等用 Intl.Segmenter 分词；找不到词返回 -1
+  // 中文等用 Intl.Segmenter 分词
   const WINDOW = 4000;
   const segmenter = typeof Intl.Segmenter === 'function' ? new Intl.Segmenter(undefined, { granularity: 'word' }) : null;
 
-  // p 之后下一个词的词尾（readline forward-word / kill-word）
-  function wordEnd(text, p) {
-    const chunk = text.slice(p, p + WINDOW);
+  // 不能用 s.isWordLike 判词：Firefox 的 ICU4X 分词把「脚本」「一个」「我们」这类中文词
+  // 标成 isWordLike=false（且随上下文变化），Alt-F 就会一次跨过好几个词。
+  // 这里只看段里有没有字母/数字，两个浏览器结果一致。
+  const WORDISH = /[\p{L}\p{N}]/u;
+  const isWord = (s) => WORDISH.test(s);
+  const isSpace = (s) => /^\s+$/.test(s);
+
+  // 把 chunk 切成 [起点, 段文本]；没有 Segmenter 时退化成「字母数字串 / 标点串 / 空白串」
+  function segmentsOf(chunk) {
+    const out = [];
     if (segmenter) {
-      for (const s of segmenter.segment(chunk)) if (s.isWordLike) return p + s.index + s.segment.length;
-      return -1;
+      for (const s of segmenter.segment(chunk)) out.push([s.index, s.segment]);
+      return out;
     }
-    const m = /[^\p{L}\p{N}_]*[\p{L}\p{N}_]+/u.exec(chunk);
-    return m ? p + m[0].length : -1;
+    const re = /[\p{L}\p{N}_]+|[^\p{L}\p{N}_\s]+|\s+/gu;
+    let m;
+    while ((m = re.exec(chunk))) out.push([m.index, m[0]]);
+    return out;
   }
 
-  // p 之前上一个词的词首（readline backward-word / backward-kill-word）
+  // p 之后的下一个停靠点：跳过空白后，落在词尾或一串连续标点的末尾
+  function wordEnd(text, p) {
+    const chunk = text.slice(p, p + WINDOW);
+    if (!chunk) return -1;
+    const segs = segmentsOf(chunk);
+    let i = 0;
+    while (i < segs.length && isSpace(segs[i][1])) i++; // 空白不算停靠点
+    if (i >= segs.length) return -1;
+    if (isWord(segs[i][1])) return p + segs[i][0] + segs[i][1].length;
+    // 标点：整串连续标点算一个停靠点，避免「，」和「“」各停一次
+    let end = segs[i][0] + segs[i][1].length;
+    while (i + 1 < segs.length && !isWord(segs[i + 1][1]) && !isSpace(segs[i + 1][1])) {
+      i++;
+      end = segs[i][0] + segs[i][1].length;
+    }
+    return p + end;
+  }
+
+  // p 之前的上一个停靠点：跳过空白后，落在词首或一串连续标点的开头
   function wordStart(text, p) {
     const from = Math.max(0, p - WINDOW);
     const chunk = text.slice(from, p);
-    if (segmenter) {
-      let start = -1;
-      for (const s of segmenter.segment(chunk)) if (s.isWordLike) start = from + s.index;
-      return start;
+    if (!chunk) return -1;
+    const segs = segmentsOf(chunk);
+    let i = segs.length - 1;
+    while (i >= 0 && isSpace(segs[i][1])) i--;
+    if (i < 0) return -1;
+    if (isWord(segs[i][1])) return from + segs[i][0];
+    let start = segs[i][0];
+    while (i - 1 >= 0 && !isWord(segs[i - 1][1]) && !isSpace(segs[i - 1][1])) {
+      i--;
+      start = segs[i][0];
     }
-    const m = /[\p{L}\p{N}_]+[^\p{L}\p{N}_]*$/u.exec(chunk);
-    return m ? from + m.index : -1;
+    return from + start;
   }
 
   // 删除的内容写入系统剪贴板
