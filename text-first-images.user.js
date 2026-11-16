@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         图片屏蔽（文字优先）
 // @namespace    https://github.com/Pilrymage/userscripts
-// @version      1.0.0
+// @version      1.0.1
 // @description  隔绝图片与视频封面，只留原尺寸虚线框和 alt 文字；点击单张可恢复原图，Alt+Shift+I 一键全开本页，每站记忆开关。拦 img / picture / video poster / CSS 背景，放过行内 SVG、canvas 和 .ico 图标。
 // @author       Pilrymage
 // @license      MIT
@@ -194,9 +194,17 @@ html.${CLS_ON} *::before, html.${CLS_ON} *::after { background-image: none !impo
       const { el } = it;
       let w = it.w;
       let h = it.h;
+      // 显式声明为 0 宽/高的元素（跟踪像素、分隔条、占位槽）本来就不显示内容，
+      // 给它们套 320×180 的兜底框只会凭空多出一个大方块，直接原样放过。
+      const attrW = el.getAttribute('width');
+      const attrH = el.getAttribute('height');
+      if ((attrW !== null && parseFloat(attrW) === 0) || (attrH !== null && parseFloat(attrH) === 0)) {
+        revealImg(el, true);
+        continue;
+      }
       if (!(w >= 8 && h >= 8)) {
-        const aw = parseFloat(el.getAttribute('width'));
-        const ah = parseFloat(el.getAttribute('height'));
+        const aw = parseFloat(attrW);
+        const ah = parseFloat(attrH);
         if (aw >= 8 && ah >= 8) {
           w = aw;
           h = ah;
@@ -212,8 +220,9 @@ html.${CLS_ON} *::before, html.${CLS_ON} *::after { background-image: none !impo
         w = 320;
         h = 180;
       }
-      // 图标尺寸（≤24px）放过：它们是按钮和功能图标，不是吸引注意力的图片
-      if (w <= 24 || h <= 24) {
+      // 图标放过：只有长宽都很小（≤24px）才算图标。
+      // 用「且」而不是「或」，否则 1000×20 的横幅会被误判成图标。
+      if (w <= 24 && h <= 24) {
         revealImg(el, true);
         continue;
       }
@@ -300,7 +309,9 @@ html.${CLS_ON} *::before, html.${CLS_ON} *::after { background-image: none !impo
     img.classList.add(CLS_KEEP);
     if (asIcon) img.setAttribute(ATTR_SKIP, '1');
     else img.setAttribute(ATTR_WANT, '1');
-    img.__dshNiDone = false;
+    // 保留 __dshNiDone = true：元素仍握着原始 src 的存档，
+    // 再次开启屏蔽时要靠这份存档把原图还原回去。重置为 false 会让
+    // handleImg 重新拦截已经放行的元素，陷入「拦截→放行→拦截」的循环。
   }
 
   // ---------- 视频 ----------
@@ -514,14 +525,26 @@ html.${CLS_ON} *::before, html.${CLS_ON} *::after { background-image: none !impo
   function blockAll() {
     if (!document.body) return;
     for (const el of document.querySelectorAll('img, video')) {
+      // 先把恢复到原图状态，再清掉一切标记。
+      // 只清 __dshNiDone 而不还原 src，会让元素停在「src 是占位图、类名却为空」的矛盾状态，
+      // 随后 handleImg 的防回环判断（src === __dshNiPh）又会提前返回，图片就永远卡住。
+      if (el.tagName === 'IMG') {
+        if (el.__dshNiSrc) el.setAttribute('src', el.__dshNiSrc);
+        const pic = el.parentElement;
+        if (pic && pic.tagName === 'PICTURE') {
+          for (const s of pic.querySelectorAll('source')) {
+            if (s.__dshNiSrcset != null) s.setAttribute('srcset', s.__dshNiSrcset);
+            if (s.__dshNiSizes != null) s.setAttribute('sizes', s.__dshNiSizes);
+          }
+        }
+        el.__dshNiPh = undefined;
+      } else if (el.__dshNiPoster != null) {
+        el.setAttribute('poster', el.__dshNiPoster);
+      }
       el.classList.remove(CLS_KEEP, CLS_PH);
       el.removeAttribute(ATTR_WANT);
       el.removeAttribute(ATTR_SKIP);
       el.__dshNiDone = false;
-      const pic = el.parentElement;
-      if (pic && pic.tagName === 'PICTURE') {
-        for (const s of pic.querySelectorAll('source')) delete s.__dshNiSrcset;
-      }
     }
     for (const el of document.querySelectorAll('*')) el.__dshNiBgDone = false;
     scanElement(document.body);
