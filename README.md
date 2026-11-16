@@ -5,6 +5,7 @@
 | 脚本 | 说明 | 安装 |
 |---|---|---|
 | Readline 键位 | 网页输入框里的 readline / Emacs 键：Ctrl+A E P N F B K D；Alt+F B 按词移动、Alt+D / Alt+Backspace 按词删除（中文分词，连续标点单独算一个停靠点）；Alt+< > 跳到开头/结尾；Ctrl+J 换行（不会触发发送）。Ctrl+K 和 Alt 删词的内容写入剪贴板 | [install](https://raw.githubusercontent.com/Pilrymage/userscripts/main/readline-keys.user.js) |
+| 图片屏蔽（文字优先） | 隔绝图片与视频封面，只留原尺寸虚线框和 alt 文字。全站默认开，Alt+Shift+I 一键全开本页，点击单张恢复原图，菜单里可按站点长期开关。拦 img / picture / video poster / CSS 背景，放过行内 SVG、canvas 和 .ico 图标 | [install](https://raw.githubusercontent.com/Pilrymage/userscripts/main/text-first-images.user.js) |
 | NotebookLM 输入框加高 | 加高输入框、提示词菜单、加宽对话区等 | [install](https://raw.githubusercontent.com/Pilrymage/userscripts/main/notebooklm-taller-input.user.js) |
 
 ## Firefox：释放 Ctrl+N
