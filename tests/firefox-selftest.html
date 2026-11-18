@@ -1,0 +1,574 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>Firefox 自测</title>
+<style>
+body { font: 13px/1.5 Consolas, monospace; margin: 8px; background: #fff; color: #000; }
+textarea { font: 14px/20px Consolas, monospace; width: 260px; height: 120px; }
+textarea.wide { font: 16px/24px "Microsoft YaHei", sans-serif; width: 320px; height: 160px; }
+textarea.narrow { width: 120px; }
+.pass { color: #060; } .fail { color: #b00; font-weight: bold; }
+h3 { margin: 8px 0 2px; font-size: 13px; }
+</style></head><body>
+<div id="report">running…</div>
+<div style="position:absolute;left:-9999px;top:0;">
+  <textarea id="t1" class="wide"></textarea>
+  <textarea id="t2" class="wide"></textarea>
+  <textarea id="t3" class="narrow"></textarea>
+  <textarea id="t4" class="wide"></textarea>
+</div>
+<script>
+// ==UserScript==
+// @name         Readline 键位（网页输入框）
+// @namespace    https://github.com/Pilrymage/userscripts
+// @version      1.5.0
+// @description  在网页输入框 / textarea / contenteditable 中启用 Bash readline / Emacs 风格按键：Ctrl+A E P N F B K D（P/N 按视觉折行上下移动，与 ↑/↓ 一致），Ctrl+J 换行，Alt+F B D Backspace（中文按词，标点单独停），Alt+< > 跳到文本开头/结尾。
+// @author       Pilrymage
+// @license      MIT
+// @homepageURL  https://github.com/Pilrymage/userscripts
+// @downloadURL  https://raw.githubusercontent.com/Pilrymage/userscripts/main/readline-keys.user.js
+// @updateURL    https://raw.githubusercontent.com/Pilrymage/userscripts/main/readline-keys.user.js
+// @match        *://*/*
+// @grant        GM_setClipboard
+// @run-at       document-start
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // 自带按键处理的代码编辑器（隐藏 textarea 方案），交给它们自己处理
+  const SKIP_SELECTOR = '.monaco-editor, .CodeMirror, .ace_editor';
+  const TEXT_INPUT_TYPES = new Set(['text', 'search', 'url', 'tel', 'password']);
+  const CTRL_KEYS = new Set(['KeyA', 'KeyE', 'KeyP', 'KeyN', 'KeyF', 'KeyB', 'KeyK', 'KeyD', 'KeyJ']);
+  const ALT_KEYS = { KeyF: 'AltF', KeyB: 'AltB', KeyD: 'AltD', Backspace: 'AltBackspace' };
+
+  // 连续 P/N 时保持的视觉列（像素），与原生 ↑/↓ 的「目标列」一致
+  let goalX = null;
+  let goalEl = null;
+
+  function getAction(e) {
+    if (e.metaKey || e.isComposing) return null;
+    if (e.ctrlKey && !e.altKey && !e.shiftKey && CTRL_KEYS.has(e.code)) return e.code;
+    if (e.altKey && !e.ctrlKey) { // AltGr 是 Ctrl+Alt，不会命中
+      if (e.key === '<') return 'AltLt'; // Alt+Shift+,
+      if (e.key === '>') return 'AltGt'; // Alt+Shift+.
+      if (!e.shiftKey && ALT_KEYS[e.code]) return ALT_KEYS[e.code];
+    }
+    return null;
+  }
+
+  function getTarget(e) {
+    const el = e.composedPath ? e.composedPath()[0] : e.target;
+    if (!(el instanceof Element)) return null;
+    if (el.closest(SKIP_SELECTOR)) return null;
+    if (el instanceof HTMLTextAreaElement) return el.readOnly || el.disabled ? null : { kind: 'field', el, multiline: true };
+    if (el instanceof HTMLInputElement) {
+      if (!TEXT_INPUT_TYPES.has(el.type) || el.readOnly || el.disabled) return null;
+      return { kind: 'field', el, multiline: false };
+    }
+    if (el.isContentEditable) return { kind: 'rich', el };
+    return null;
+  }
+
+  // ---------- 文本工具 ----------
+  const isHigh = (c) => c >= 0xd800 && c <= 0xdbff;
+  const isLow = (c) => c >= 0xdc00 && c <= 0xdfff;
+  const nextPos = (v, p) => Math.min(v.length, p + (isHigh(v.charCodeAt(p)) && isLow(v.charCodeAt(p + 1)) ? 2 : 1));
+  const prevPos = (v, p) => Math.max(0, p - (isLow(v.charCodeAt(p - 1)) && isHigh(v.charCodeAt(p - 2)) ? 2 : 1));
+  const lineStart = (v, p) => v.lastIndexOf('\n', p - 1) + 1;
+  const lineEnd = (v, p) => { const i = v.indexOf('\n', p); return i < 0 ? v.length : i; };
+
+  // 中文等用 Intl.Segmenter 分词
+  const WINDOW = 4000;
+  const segmenter = typeof Intl.Segmenter === 'function' ? new Intl.Segmenter(undefined, { granularity: 'word' }) : null;
+
+  // 不能用 s.isWordLike 判词：Firefox 的 ICU4X 分词把「脚本」「一个」「我们」这类中文词
+  // 标成 isWordLike=false（且随上下文变化），Alt-F 就会一次跨过好几个词。
+  // 这里只看段里有没有字母/数字，两个浏览器结果一致。
+  const WORDISH = /[\p{L}\p{N}]/u;
+  const isWord = (s) => WORDISH.test(s);
+  const isSpace = (s) => /^\s+$/.test(s);
+
+  // 把 chunk 切成 [起点, 段文本]；没有 Segmenter 时退化成「字母数字串 / 标点串 / 空白串」
+  function segmentsOf(chunk) {
+    const out = [];
+    if (segmenter) {
+      for (const s of segmenter.segment(chunk)) out.push([s.index, s.segment]);
+      return out;
+    }
+    const re = /[\p{L}\p{N}_]+|[^\p{L}\p{N}_\s]+|\s+/gu;
+    let m;
+    while ((m = re.exec(chunk))) out.push([m.index, m[0]]);
+    return out;
+  }
+
+  // p 之后的下一个停靠点：跳过空白后，落在词尾或一串连续标点的末尾
+  function wordEnd(text, p) {
+    const chunk = text.slice(p, p + WINDOW);
+    if (!chunk) return -1;
+    const segs = segmentsOf(chunk);
+    let i = 0;
+    while (i < segs.length && isSpace(segs[i][1])) i++; // 空白不算停靠点
+    if (i >= segs.length) return -1;
+    if (isWord(segs[i][1])) return p + segs[i][0] + segs[i][1].length;
+    // 标点：整串连续标点算一个停靠点，避免「，」和「“」各停一次
+    let end = segs[i][0] + segs[i][1].length;
+    while (i + 1 < segs.length && !isWord(segs[i + 1][1]) && !isSpace(segs[i + 1][1])) {
+      i++;
+      end = segs[i][0] + segs[i][1].length;
+    }
+    return p + end;
+  }
+
+  // p 之前的上一个停靠点：跳过空白后，落在词首或一串连续标点的开头
+  function wordStart(text, p) {
+    const from = Math.max(0, p - WINDOW);
+    const chunk = text.slice(from, p);
+    if (!chunk) return -1;
+    const segs = segmentsOf(chunk);
+    let i = segs.length - 1;
+    while (i >= 0 && isSpace(segs[i][1])) i--;
+    if (i < 0) return -1;
+    if (isWord(segs[i][1])) return from + segs[i][0];
+    let start = segs[i][0];
+    while (i - 1 >= 0 && !isWord(segs[i - 1][1]) && !isSpace(segs[i - 1][1])) {
+      i--;
+      start = segs[i][0];
+    }
+    return from + start;
+  }
+
+  // 删除的内容写入系统剪贴板
+  function copyKill(text) {
+    if (!text) return;
+    try { GM_setClipboard(text, 'text'); } catch (_) {
+      navigator.clipboard && navigator.clipboard.writeText(text).catch(() => {});
+    }
+  }
+
+  // ---------- 视觉行上下移动（Ctrl+P / Ctrl+N，行为对齐原生 ↑/↓） ----------
+  // 浏览器不暴露 textarea 内部的折行信息，所以把同样的文字和排版复制到一个隐藏镜像里，
+  // 让浏览器自己折行；软换行、比例字体、中英混排、tab 的断行规则都与真实渲染一致。
+  //
+  // 原生 ↑/↓ 的规则（实测）：目标视觉行里取「离当前 caret 的 x 最近的那个 caret」。
+  // 到短行就贴到行尾，回到长行还能回到原来的 x，所以目标列要独立于当前 offset 记住。
+  const MIRROR_PROPS = [
+    'fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'fontVariant',
+    'fontVariantCaps', 'fontVariantEastAsian', 'fontVariantLigatures', 'fontVariantNumeric',
+    'fontVariantPosition', 'fontStretch', 'fontKerning', 'fontFeatureSettings', 'fontVariationSettings',
+    'fontOpticalSizing', 'fontSizeAdjust', 'lineHeight', 'letterSpacing', 'wordSpacing', 'textTransform',
+    'textIndent', 'tabSize', 'direction', 'textAlign', 'textAlignLast', 'textRendering', 'textJustify',
+    'wordBreak', 'overflowWrap', 'lineBreak', 'whiteSpace', 'hyphens', 'zoom',
+  ];
+
+  let mirror = null, mirrorOwner = null, mirrorValue = null, mirrorWidth = -1, mirrorModel = null;
+
+  function mirrorFor(el, cs) {
+    const width = Math.max(0, el.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight));
+    if (mirror && mirrorOwner === el && mirrorValue === el.value && mirrorWidth === width) return mirror;
+    if (!mirror) {
+      mirror = document.createElement('div');
+      mirror.setAttribute('aria-hidden', 'true');
+      mirror.style.cssText = 'position:absolute;left:-99999px;top:0;height:auto;max-height:none;min-height:0;' +
+        'overflow:visible;border:0;margin:0;padding:0;box-sizing:content-box;visibility:hidden;' +
+        'pointer-events:none;contain:none;white-space:pre-wrap;';
+    }
+    if (!mirror.isConnected) document.body.appendChild(mirror);
+    for (const prop of MIRROR_PROPS) {
+      const val = cs[prop];
+      if (val) mirror.style[prop] = val;
+    }
+    mirror.style.width = width + 'px';
+    mirror.textContent = el.value;
+    mirrorOwner = el;
+    mirrorValue = el.value;
+    mirrorWidth = width;
+    mirrorModel = null;
+    return mirror;
+  }
+
+  // 建视觉行模型：每行是一串 { p, x }，x 相对镜像内容区左边。
+  //
+  // 三处容易算错的地方（都用原生 ↑/↓ 实测校准过）：
+  // 1. 软折行：offset 归到「字符字形所在那一行」，所以 p 取字符矩形的左边缘，
+  //    折行后的首个字符自然落在下一行行首。折叠 Range 会把它画到上一行行尾，不能用。
+  // 2. 行尾 / 文末：贴在最后一个字符的右边缘、与它同一行。
+  // 3. 空行：Range 高度为 0，拿不到矩形，要用行高精确推出来，否则空行会被合并掉，
+  //    而原生 ↑/↓ 是会在空行上停一次的。
+  function buildModel(el, cs) {
+    const m = mirrorFor(el, cs);
+    const node = m.firstChild;
+    const len = el.value.length;
+    if (!node) return { rows: [], at: new Map() };
+    const rect = m.getBoundingClientRect();
+    const originX = rect.left;
+    const originY = rect.top;
+    const lineHeight = parseFloat(cs.lineHeight) || (rect.height || 20);
+    const range = document.createRange();
+    const boxOf = (a, b) => {
+      range.setStart(node, a);
+      range.setEnd(node, b);
+      const r = range.getBoundingClientRect();
+      if (r.height) return r;
+      const list = range.getClientRects();
+      return list.length ? list[list.length - 1] : r;
+    };
+    const glyphTop = (p) => {           // 该 offset 上字符字形所在行的 top；行尾返回 -1
+      if (p >= len || node.data.charCodeAt(p) === 10) return -1;
+      const r = boxOf(p, nextPos(node.data, p));
+      return r.height ? r.top - originY : -1;
+    };
+
+    const rows = [];
+    const at = new Map();
+    let current = null;
+
+    for (let p = 0; p <= len; p++) {
+      const isNl = p < len && node.data.charCodeAt(p) === 10;
+      let top, x;
+
+      if (p < len && !isNl) {
+        // 普通字符：字形所在行、左边缘
+        const r = boxOf(p, nextPos(node.data, p));
+        top = r.top - originY;
+        x = r.left - originX;
+      } else {
+        // 行尾 / 硬换行处 / 文末
+        const prevChar = p > 0 ? node.data.charCodeAt(p - 1) : -1;
+        const prevIsNl = prevChar === 10;
+        if (prevIsNl) {
+          // 硬换行之后：换行符所在行的下一行、行首
+          const r = boxOf(p - 1, p);
+          const nlTop = r.height ? r.top - originY : (current ? current.top : 0);
+          top = nlTop + lineHeight;
+          x = 0;
+        } else if (p > 0) {
+          const r = boxOf(p - 1, p);
+          const prevTop = r.height ? r.top - originY : (current ? current.top : 0);
+          // 前一个字符若在更上面的行（说明 p 恰好在软折行处），行尾要落在它那一行
+          top = prevTop;
+          x = r.right - originX;
+        } else {
+          const r = boxOf(0, 0);
+          top = r.height ? r.top - originY : 0;
+          x = r.left - originX;
+        }
+      }
+
+      if (!current || Math.abs(current.top - top) > 1) {
+        current = { top, items: [], blank: true };
+        rows.push(current);
+      }
+      current.items.push({ p, x });
+      if (p < len && !isNl) current.blank = false;
+      at.set(p, { row: rows.length - 1, x });
+    }
+
+    // 视觉行的「行尾」在原生里是下一行的第一个 offset，不是本行最后一个字符之后。
+    // 例如等宽文本 0..30 | 31..61 里，第 0 行行尾是 31 而不是 30 的右侧。
+    // 所以给非末行补一个「行尾」项：offset = 下一行的首项，x 取本行最后一个字符的右边缘。
+    for (let i = 0; i < rows.length - 1; i++) {
+      const row = rows[i];
+      const nextRow = rows[i + 1];
+      if (!row.items.length || !nextRow.items.length) continue;
+      const endP = nextRow.items[0].p;
+      if (row.items.some(it => it.p === endP)) continue;
+      const lastP = row.items[row.items.length - 1].p;
+      let endX = row.items[row.items.length - 1].x;
+      if (lastP < len) {
+        const r = boxOf(lastP, nextPos(node.data, lastP));
+        if (r.height) endX = r.right - originX;
+      }
+      row.items.push({ p: endP, x: endX, isEnd: true });
+    }
+    return { rows, at };
+  }
+
+  function modelFor(el, cs) {
+    // 必须先走 mirrorFor：缓存失效（换元素 / 改文本 / 改宽度）的判定在那里，
+    // 它会顺带清掉 mirrorModel。直接判断 mirrorModel 会拿到上一个元素的模型。
+    mirrorFor(el, cs);
+    if (!mirrorModel) mirrorModel = buildModel(el, cs);
+    return mirrorModel;
+  }
+
+  function visualLineMove(el, p, dir, goal) {
+    const cs = getComputedStyle(el);
+    const { rows, at } = modelFor(el, cs);
+    if (!rows.length) return p;
+    const here = at.get(p);
+    if (!here) return p;
+    const target = here.row + dir;
+    if (target < 0) return 0;
+    if (target >= rows.length) return el.value.length;
+
+    const row = rows[target];
+    // 空行只有一个 caret，落到它上面（原生从空行再往上就是上一行行首，不用特殊处理）
+    if (row.blank) return row.items[0].p;
+
+    // 目标行里离目标列最近的 caret。
+    // 先取整再比较：原生内部按整数设备像素算坐标，直接用 CSS 浮点会在
+    // 两个字符中间的位置上偏一个字符（混合宽度字体里尤其明显）。
+    const gx = Math.round(goal.x);
+    let best = null, bestD = Infinity;
+    for (const it of row.items) {
+      if (it.p === p) continue;              // 软折行的行尾别名就是自己，跳过，否则会原地不动
+      const d = Math.abs(Math.round(it.x) - gx);
+      if (d < bestD) { bestD = d; best = it; }
+    }
+    if (best) return best.p;
+
+    // 目标行里只有它自己（软折行别名独占）：再走一行
+    const far = here.row + dir * 2;
+    if (far < 0) return 0;
+    if (far >= rows.length) return el.value.length;
+    let alt = null, altD = Infinity;
+    for (const it of rows[far].items) {
+      const d = Math.abs(Math.round(it.x) - gx);
+      if (d < altD) { altD = d; alt = it; }
+    }
+    return alt ? alt.p : p;
+  }
+
+  function resetGoal() { goalX = null; goalEl = null; }
+
+
+
+  // ---------- input / textarea ----------
+  function moveTo(el, p) { el.setSelectionRange(p, p); }
+
+  function deleteRange(el, from, to, copy) {
+    if (from >= to) return;
+    if (copy) copyKill(el.value.slice(from, to));
+    el.setSelectionRange(from, to);
+    // execCommand 保留撤销栈，并触发 input 事件让 React/Vue 同步
+    if (!document.execCommand('delete')) {
+      el.setRangeText('', from, to, 'start');
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContent' }));
+    }
+  }
+
+  function handleField(action, el, multiline) {
+    const v = el.value;
+    const p = el.selectionDirection === 'backward' ? el.selectionStart : el.selectionEnd;
+    const ls = lineStart(v, p);
+    const le = lineEnd(v, p);
+    if (action !== 'KeyP' && action !== 'KeyN') goalX = null;
+
+    switch (action) {
+      case 'KeyA': moveTo(el, ls); break;
+      case 'KeyE': moveTo(el, le); break;
+      case 'KeyF': moveTo(el, nextPos(v, p)); break;
+      case 'KeyB': moveTo(el, prevPos(v, p)); break;
+      case 'KeyP':
+      case 'KeyN': {
+        // 和原生 ↑/↓ 一样按视觉行移动：连续按保持在同一个像素 x；
+        // 一旦因为到短行被截断，后续方向键仍以最初的 x 为准（可逆），直到出现非上下移动的按键。
+        if (!multiline) {
+          // 单行 input 不会折行：等同于行首 / 行尾
+          const next = action === 'KeyP' ? ls : le;
+          if (next !== p) moveTo(el, next);
+          break;
+        }
+        const cs = getComputedStyle(el);
+        const model = modelFor(el, cs);
+        const here = model.at.get(p);
+        if (!here) break;
+        if (goalX === null || goalEl !== el) {
+          goalX = here.x;
+          goalEl = el;
+        }
+        const next = visualLineMove(el, p, action === 'KeyP' ? -1 : 1, { x: goalX });
+        if (next !== p) moveTo(el, next);
+        break;
+      }
+      case 'KeyK': deleteRange(el, p, le === p ? nextPos(v, p) : le, true); break;
+      case 'KeyD':
+        if (el.selectionStart !== el.selectionEnd) deleteRange(el, el.selectionStart, el.selectionEnd);
+        else deleteRange(el, p, nextPos(v, p));
+        break;
+      case 'KeyJ':
+        // 直接插入换行，不经过页面的 Enter 处理（不会误发送）
+        if (multiline && !document.execCommand('insertText', false, '\n')) {
+          el.setRangeText('\n', el.selectionStart, el.selectionEnd, 'end');
+          el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertLineBreak' }));
+        }
+        break;
+      case 'AltF': { const we = wordEnd(v, p); moveTo(el, we < 0 ? v.length : we); break; }
+      case 'AltB': { const ws = wordStart(v, p); moveTo(el, ws < 0 ? 0 : ws); break; }
+      case 'AltD': { const we = wordEnd(v, p); deleteRange(el, p, we < 0 ? v.length : we, true); break; }
+      case 'AltBackspace': { const ws = wordStart(v, p); deleteRange(el, ws < 0 ? 0 : ws, p, true); break; }
+      case 'AltLt': moveTo(el, 0); el.scrollTop = 0; break;
+      case 'AltGt': moveTo(el, v.length); el.scrollTop = el.scrollHeight; break;
+    }
+  }
+
+  // ---------- contenteditable ----------
+  function editingHost(el) {
+    while (el.parentElement && el.parentElement.isContentEditable) el = el.parentElement;
+    return el;
+  }
+
+  function scrollCaretIntoView(sel) {
+    const n = sel.focusNode;
+    const target = n && (n.nodeType === Node.TEXT_NODE ? n.parentElement : n);
+    if (target && target.scrollIntoView) target.scrollIntoView({ block: 'nearest' });
+  }
+
+  // 富文本编辑器（ProseMirror、Lexical、Quill 等）自己维护文档模型，直接改 DOM 不可靠。
+  // 先模拟一次 Shift+Enter（各家聊天框通用的换行键），页面处理了就会 preventDefault；
+  // 没人处理时再用 execCommand 兜底。
+  function insertRichNewline(el) {
+    const init = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, shiftKey: true, bubbles: true, cancelable: true, composed: true };
+    const down = new KeyboardEvent('keydown', init);
+    const handled = !el.dispatchEvent(down);
+    el.dispatchEvent(new KeyboardEvent('keyup', init));
+    if (handled) return;
+    if (!document.execCommand('insertLineBreak')) document.execCommand('insertParagraph');
+  }
+
+  function handleRich(action, el) {
+    const sel = window.getSelection();
+    if (!sel || !sel.rangeCount) return;
+    // readline 没有选区概念：先收拢到光标所在端
+    if (!sel.isCollapsed && action !== 'KeyD') sel.collapse(sel.focusNode, sel.focusOffset);
+    const node = sel.focusNode, off = sel.focusOffset;
+    const text = node && node.nodeType === Node.TEXT_NODE ? node.data : null;
+    const kill = () => { if (!sel.isCollapsed) { copyKill(sel.toString()); document.execCommand('delete'); } };
+
+    switch (action) {
+      case 'KeyA': sel.modify('move', 'backward', 'lineboundary'); break;
+      case 'KeyE': sel.modify('move', 'forward', 'lineboundary'); break;
+      case 'KeyF': sel.modify('move', 'forward', 'character'); break;
+      case 'KeyB': sel.modify('move', 'backward', 'character'); break;
+      case 'KeyP': sel.modify('move', 'backward', 'line'); break;
+      case 'KeyN': sel.modify('move', 'forward', 'line'); break;
+      case 'KeyK':
+        sel.modify('extend', 'forward', 'lineboundary');
+        if (sel.isCollapsed) sel.modify('extend', 'forward', 'character');
+        kill();
+        break;
+      case 'KeyD': document.execCommand('forwardDelete'); break;
+      case 'KeyJ': insertRichNewline(el); break;
+      // 词操作：优先在当前文本节点内分词；跨节点时交给浏览器的按词移动
+      case 'AltF': {
+        const we = text !== null ? wordEnd(text, off) : -1;
+        if (we > off) sel.collapse(node, we); else sel.modify('move', 'forward', 'word');
+        break;
+      }
+      case 'AltB': {
+        const ws = text !== null ? wordStart(text, off) : -1;
+        if (ws >= 0 && ws < off) sel.collapse(node, ws); else sel.modify('move', 'backward', 'word');
+        break;
+      }
+      case 'AltD': {
+        const we = text !== null ? wordEnd(text, off) : -1;
+        if (we > off) sel.setBaseAndExtent(node, off, node, we); else sel.modify('extend', 'forward', 'word');
+        kill();
+        break;
+      }
+      case 'AltBackspace': {
+        const ws = text !== null ? wordStart(text, off) : -1;
+        if (ws >= 0 && ws < off) sel.setBaseAndExtent(node, off, node, ws); else sel.modify('extend', 'backward', 'word');
+        kill();
+        break;
+      }
+      case 'AltLt':
+      case 'AltGt': {
+        const range = document.createRange();
+        range.selectNodeContents(editingHost(el));
+        range.collapse(action === 'AltLt');
+        sel.removeAllRanges();
+        sel.addRange(range);
+        scrollCaretIntoView(sel);
+        break;
+      }
+    }
+  }
+
+  window.addEventListener('keydown', (e) => {
+    const action = getAction(e);
+    if (!action) return;
+    const t = getTarget(e);
+    if (!t) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    if (t.kind === 'field') handleField(action, t.el, t.multiline);
+    else { resetGoal(); handleRich(action, t.el); }
+  }, true);
+
+  // 「目标列」只在一串连续的 Ctrl+P / Ctrl+N 里有效。
+  // 打字、方向键、翻页键、鼠标点击或切走焦点，都结束这一轮，下次上下以新位置为起点。
+  window.addEventListener('beforeinput', (e) => {
+    if (!goalEl) return;
+    if (/^(insert|delete)/.test(e.inputType || '')) resetGoal();
+  }, true);
+
+  window.addEventListener('click', () => resetGoal(), true);
+
+  window.addEventListener('keydown', (e) => {
+    if (!goalEl || e.isComposing) return;
+    if (e.ctrlKey && !e.altKey && !e.shiftKey && (e.code === 'KeyP' || e.code === 'KeyN')) return;
+    if (e.key.startsWith('Arrow') || e.key === 'Home' || e.key === 'End' ||
+        e.key === 'PageUp' || e.key === 'PageDown') resetGoal();
+  }, true);
+
+  window.__dbg = { visualLineMove, buildModel, modelFor };
+})();
+
+</script>
+<script>
+(function () {
+  const lines = [];
+  const log = (cls, msg) => lines.push('<div class="' + cls + '">' + msg + '</div>');
+  const ok = (cond, msg) => log(cond ? 'pass' : 'fail', (cond ? 'PASS  ' : 'FAIL  ') + msg);
+
+  log('', 'userAgent: ' + navigator.userAgent);
+  ok(typeof document.caretPositionFromPoint === 'function', 'caretPositionFromPoint 可用');
+  ok(typeof Intl.Segmenter === 'function', 'Intl.Segmenter 可用');
+
+  const CASES = [{"id":"t1","name":"等宽 3.5 行","text":"the quick brown fox jumps over the lazy dog and keeps running far away before it stops at the fence"},{"id":"t2","name":"中英混排（含硬换行）","text":"第一行比较短\n这是一段中文和 English words 混排的测试文本，用来检查折行位置是否准确，再来一些标点。"},{"id":"t4","name":"多段 + 空行","text":"first line\nsecond line is a longer one that wraps\n\nfourth after blank\nfifth unicorn line that also wraps around the narrow box edge"},{"id":"t3","name":"窄框超长单词","text":"Supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis tail"}];
+
+  for (const c of CASES) {
+    const el = document.getElementById(c.id);
+    el.value = c.text;
+    el.focus();
+    el.scrollTop = 0;
+
+    const m = window.__dbg.modelFor(el, getComputedStyle(el));
+    const rows = m.rows;
+    log('', '<h3>' + c.name + '（' + rows.length + ' 视觉行）</h3>');
+
+    // 行首 ↓ 必须落在下一行内
+    let downBad = [];
+    for (let r = 0; r < rows.length - 1; r++) {
+      const first = rows[r].items[0];
+      const next = window.__dbg.visualLineMove(el, first.p, 1, { x: first.x });
+      if (!rows[r + 1].items.some(i => i.p === next)) downBad.push(first.p + '→' + next);
+    }
+    ok(downBad.length === 0, '行首 ↓ 落在下一行内' + (downBad.length ? ' 失败: ' + downBad.join(',') : ''));
+
+    // 行尾 ↑ 必须落在上一行内（或上一行真正的最后一个字符）
+    let upBad = [];
+    for (let r = 1; r < rows.length; r++) {
+      const last = rows[r].items[rows[r].items.length - 1];
+      const prev = window.__dbg.visualLineMove(el, last.p, -1, { x: last.x });
+      const prevPs = rows[r - 1].items.map(i => i.p);
+      if (!prevPs.includes(prev) && prev !== last.p - 1) upBad.push(last.p + '→' + prev);
+    }
+    ok(upBad.length === 0, '行尾 ↑ 落在上一行内' + (upBad.length ? ' 失败: ' + upBad.join(',') : ''));
+
+    // 可逆：从中间 ↓ 到底再 ↑ 回起点
+    const mid = Math.min(el.value.length, Math.floor(el.value.length / 2));
+    const start = m.at.has(mid) ? mid : rows[0].items[0].p;
+    const x0 = m.at.get(start).x;
+    let p = start, steps = 0;
+    while (steps < 200) { const n = window.__dbg.visualLineMove(el, p, 1, { x: x0 }); if (n === p) break; p = n; steps++; }
+    let back = 0;
+    while (back < 200 && p !== start) { const n = window.__dbg.visualLineMove(el, p, -1, { x: x0 }); if (n === p) break; p = n; back++; }
+    ok(p === start, '可逆：↓×' + steps + ' 再 ↑×' + back + ' 回到起点');
+  }
+
+  document.getElementById('report').innerHTML = lines.join('\n') +
+    '<div style="margin-top:10px;font-weight:bold">DONE</div>';
+})();
+</script>
+</body></html>

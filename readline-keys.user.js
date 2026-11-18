@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Readline 键位（网页输入框）
 // @namespace    https://github.com/Pilrymage/userscripts
-// @version      1.4.1
-// @description  在网页输入框 / textarea / contenteditable 中启用 Bash readline / Emacs 风格按键：Ctrl+A E P N F B K D，Ctrl+J 换行，Alt+F B D Backspace（中文按词，标点单独停），Alt+< > 跳到文本开头/结尾。
+// @version      1.5.0
+// @description  在网页输入框 / textarea / contenteditable 中启用 Bash readline / Emacs 风格按键：Ctrl+A E P N F B K D（P/N 按视觉折行上下移动，落点对齐原生 ↑/↓），Ctrl+J 换行，Alt+F B D Backspace（中文按词，标点单独停），Alt+< > 跳到文本开头/结尾。
 // @author       Pilrymage
 // @license      MIT
 // @homepageURL  https://github.com/Pilrymage/userscripts
@@ -22,7 +22,9 @@
   const CTRL_KEYS = new Set(['KeyA', 'KeyE', 'KeyP', 'KeyN', 'KeyF', 'KeyB', 'KeyK', 'KeyD', 'KeyJ']);
   const ALT_KEYS = { KeyF: 'AltF', KeyB: 'AltB', KeyD: 'AltD', Backspace: 'AltBackspace' };
 
-  let goalColumn = null; // 连续 P/N 时保持列
+  // 连续 P/N 时保持的视觉列（像素），与原生 ↑/↓ 的「目标列」一致
+  let goalX = null;
+  let goalEl = null;
 
   function getAction(e) {
     if (e.metaKey || e.isComposing) return null;
@@ -124,6 +126,187 @@
     }
   }
 
+  // ---------- 视觉行上下移动（Ctrl+P / Ctrl+N，行为对齐原生 ↑/↓） ----------
+  // 浏览器不暴露 textarea 内部的折行信息，所以把同样的文字和排版复制到一个隐藏镜像里，
+  // 让浏览器自己折行；软换行、比例字体、中英混排、tab 的断行规则都与真实渲染一致。
+  //
+  // 原生 ↑/↓ 的规则（实测）：目标视觉行里取「离当前 caret 的 x 最近的那个 caret」。
+  // 到短行就贴到行尾，回到长行还能回到原来的 x，所以目标列要独立于当前 offset 记住。
+  const MIRROR_PROPS = [
+    'fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'fontVariant',
+    'fontVariantCaps', 'fontVariantEastAsian', 'fontVariantLigatures', 'fontVariantNumeric',
+    'fontVariantPosition', 'fontStretch', 'fontKerning', 'fontFeatureSettings', 'fontVariationSettings',
+    'fontOpticalSizing', 'fontSizeAdjust', 'lineHeight', 'letterSpacing', 'wordSpacing', 'textTransform',
+    'textIndent', 'tabSize', 'direction', 'textAlign', 'textAlignLast', 'textRendering', 'textJustify',
+    'wordBreak', 'overflowWrap', 'lineBreak', 'whiteSpace', 'hyphens', 'zoom',
+  ];
+
+  let mirror = null, mirrorOwner = null, mirrorValue = null, mirrorWidth = -1, mirrorModel = null;
+
+  function mirrorFor(el, cs) {
+    const width = Math.max(0, el.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight));
+    if (mirror && mirrorOwner === el && mirrorValue === el.value && mirrorWidth === width) return mirror;
+    if (!mirror) {
+      mirror = document.createElement('div');
+      mirror.setAttribute('aria-hidden', 'true');
+      mirror.style.cssText = 'position:absolute;left:-99999px;top:0;height:auto;max-height:none;min-height:0;' +
+        'overflow:visible;border:0;margin:0;padding:0;box-sizing:content-box;visibility:hidden;' +
+        'pointer-events:none;contain:none;white-space:pre-wrap;';
+    }
+    if (!mirror.isConnected) document.body.appendChild(mirror);
+    for (const prop of MIRROR_PROPS) {
+      const val = cs[prop];
+      if (val) mirror.style[prop] = val;
+    }
+    mirror.style.width = width + 'px';
+    mirror.textContent = el.value;
+    mirrorOwner = el;
+    mirrorValue = el.value;
+    mirrorWidth = width;
+    mirrorModel = null;
+    return mirror;
+  }
+
+  // 建视觉行模型：每行是一串 { p, x }，x 相对镜像内容区左边。
+  //
+  // 三处容易算错的地方（都用原生 ↑/↓ 实测校准过）：
+  // 1. 软折行：offset 归到「字符字形所在那一行」，所以 p 取字符矩形的左边缘，
+  //    折行后的首个字符自然落在下一行行首。折叠 Range 会把它画到上一行行尾，不能用。
+  // 2. 行尾 / 文末：贴在最后一个字符的右边缘、与它同一行。
+  // 3. 空行：Range 高度为 0，拿不到矩形，要用行高精确推出来，否则空行会被合并掉，
+  //    而原生 ↑/↓ 是会在空行上停一次的。
+  function buildModel(el, cs) {
+    const m = mirrorFor(el, cs);
+    const node = m.firstChild;
+    const len = el.value.length;
+    if (!node) return { rows: [], at: new Map() };
+    const rect = m.getBoundingClientRect();
+    const originX = rect.left;
+    const originY = rect.top;
+    const lineHeight = parseFloat(cs.lineHeight) || (rect.height || 20);
+    const range = document.createRange();
+    const boxOf = (a, b) => {
+      range.setStart(node, a);
+      range.setEnd(node, b);
+      const r = range.getBoundingClientRect();
+      if (r.height) return r;
+      const list = range.getClientRects();
+      return list.length ? list[list.length - 1] : r;
+    };
+
+    const rows = [];
+    const at = new Map();
+    let current = null;
+
+    for (let p = 0; p <= len; p++) {
+      const isNl = p < len && node.data.charCodeAt(p) === 10;
+      let top, x;
+
+      if (p < len && !isNl) {
+        // 普通字符：字形所在行、左边缘
+        const r = boxOf(p, nextPos(node.data, p));
+        top = r.top - originY;
+        x = r.left - originX;
+      } else {
+        // 行尾 / 硬换行处 / 文末
+        if (p > 0 && node.data.charCodeAt(p - 1) === 10) {
+          // 硬换行之后：换行符所在行的下一行、行首
+          const r = boxOf(p - 1, p);
+          const nlTop = r.height ? r.top - originY : (current ? current.top : 0);
+          top = nlTop + lineHeight;
+          x = 0;
+        } else if (p > 0) {
+          // 行尾：站在前一个字符的右边缘、与它同一行（p 恰在软折行处时也落回那一行）
+          const r = boxOf(p - 1, p);
+          top = r.height ? r.top - originY : (current ? current.top : 0);
+          x = r.right - originX;
+        } else {
+          const r = boxOf(0, 0);
+          top = r.height ? r.top - originY : 0;
+          x = r.left - originX;
+        }
+      }
+
+      if (!current || Math.abs(current.top - top) > 1) {
+        current = { top, items: [], blank: true };
+        rows.push(current);
+      }
+      current.items.push({ p, x });
+      if (p < len && !isNl) current.blank = false;
+      at.set(p, { row: rows.length - 1, x });
+    }
+
+    // 视觉行的「行尾」在原生里是下一行的第一个 offset，不是本行最后一个字符之后。
+    // 例如等宽文本 0..30 | 31..61 里，第 0 行行尾是 31 而不是 30 的右侧。
+    // 所以给非末行补一个「行尾」项：offset = 下一行的首项，x 取本行最后一个字符的右边缘。
+    // 这样「行尾按 ↑」会落在上一行的真实行尾，「行首按 ↓」也不会漏掉这一行的结尾。
+    for (let i = 0; i < rows.length - 1; i++) {
+      const row = rows[i];
+      const nextRow = rows[i + 1];
+      if (!row.items.length || !nextRow.items.length) continue;
+      const endP = nextRow.items[0].p;
+      if (row.items.some(it => it.p === endP)) continue;
+      const lastP = row.items[row.items.length - 1].p;
+      let endX = row.items[row.items.length - 1].x;
+      if (lastP < len) {
+        const r = boxOf(lastP, nextPos(node.data, lastP));
+        if (r.height) endX = r.right - originX;
+      }
+      row.items.push({ p: endP, x: endX, isEnd: true });
+    }
+    return { rows, at };
+  }
+
+  function modelFor(el, cs) {
+    // 必须先走 mirrorFor：缓存失效（换元素 / 改文本 / 改宽度）的判定在那里，
+    // 它会顺带清掉 mirrorModel。直接判断 mirrorModel 会拿到上一个元素的模型。
+    mirrorFor(el, cs);
+    if (!mirrorModel) mirrorModel = buildModel(el, cs);
+    return mirrorModel;
+  }
+
+  function visualLineMove(el, p, dir, goal) {
+    const cs = getComputedStyle(el);
+    const { rows, at } = modelFor(el, cs);
+    if (!rows.length) return p;
+    const here = at.get(p);
+    if (!here) return p;
+    const target = here.row + dir;
+    if (target < 0) return 0;
+    if (target >= rows.length) return el.value.length;
+
+    const row = rows[target];
+    // 空行只有一个 caret，落在它上面（再往上/下就是相邻行的行首，和原生一致）
+    if (row.blank) return row.items[0].p;
+
+    // 目标行里离目标列最近的 caret。
+    // 先取整再比较：原生内部按整数设备像素算坐标，直接用 CSS 浮点会在
+    // 两个字符中间的位置上偏一个字符（混合宽度字体里尤其明显）。
+    const gx = Math.round(goal.x);
+    let best = null, bestD = Infinity;
+    for (const it of row.items) {
+      // 跳过自己：软折行点的 offset 同时是上一行的行尾和本行的行首，
+      // 不跳过的话从它按 ↑ 会原地不动。
+      if (it.p === p) continue;
+      const d = Math.abs(Math.round(it.x) - gx);
+      if (d < bestD) { bestD = d; best = it; }
+    }
+    if (best) return best.p;
+
+    // 极端情况：目标行除了自己没别的 caret（例如一行只有一个软折行点），再走一行
+    const far = here.row + dir * 2;
+    if (far < 0) return 0;
+    if (far >= rows.length) return el.value.length;
+    let alt = null, altD = Infinity;
+    for (const it of rows[far].items) {
+      const d = Math.abs(Math.round(it.x) - gx);
+      if (d < altD) { altD = d; alt = it; }
+    }
+    return alt ? alt.p : p;
+  }
+
+  function resetGoal() { goalX = null; goalEl = null; }
+
   // ---------- input / textarea ----------
   function moveTo(el, p) { el.setSelectionRange(p, p); }
 
@@ -143,7 +326,7 @@
     const p = el.selectionDirection === 'backward' ? el.selectionStart : el.selectionEnd;
     const ls = lineStart(v, p);
     const le = lineEnd(v, p);
-    if (action !== 'KeyP' && action !== 'KeyN') goalColumn = null;
+    if (action !== 'KeyP' && action !== 'KeyN') goalX = null;
 
     switch (action) {
       case 'KeyA': moveTo(el, ls); break;
@@ -152,17 +335,24 @@
       case 'KeyB': moveTo(el, prevPos(v, p)); break;
       case 'KeyP':
       case 'KeyN': {
-        if (!multiline) break;
-        if (goalColumn === null) goalColumn = p - ls;
-        if (action === 'KeyP') {
-          if (ls === 0) { moveTo(el, 0); break; }
-          const pls = lineStart(v, ls - 1);
-          moveTo(el, Math.min(pls + goalColumn, ls - 1));
-        } else {
-          if (le === v.length) { moveTo(el, v.length); break; }
-          const nls = le + 1;
-          moveTo(el, Math.min(nls + goalColumn, lineEnd(v, nls)));
+        // 和原生 ↑/↓ 一样按视觉行移动：连续按保持在同一个像素 x；
+        // 一旦因为到短行被截断，后续方向键仍以最初的 x 为准（可逆），直到出现非上下移动的按键。
+        if (!multiline) {
+          // 单行 input 不会折行：等同于行首 / 行尾
+          const next = action === 'KeyP' ? ls : le;
+          if (next !== p) moveTo(el, next);
+          break;
         }
+        const cs = getComputedStyle(el);
+        const model = modelFor(el, cs);
+        const here = model.at.get(p);
+        if (!here) break;
+        if (goalX === null || goalEl !== el) {
+          goalX = here.x;
+          goalEl = el;
+        }
+        const next = visualLineMove(el, p, action === 'KeyP' ? -1 : 1, { x: goalX });
+        if (next !== p) moveTo(el, next);
         break;
       }
       case 'KeyK': deleteRange(el, p, le === p ? nextPos(v, p) : le, true); break;
@@ -277,6 +467,28 @@
     e.preventDefault();
     e.stopImmediatePropagation();
     if (t.kind === 'field') handleField(action, t.el, t.multiline);
-    else { goalColumn = null; handleRich(action, t.el); }
+    else { resetGoal(); handleRich(action, t.el); }
+  }, true);
+
+  // 「目标列」只在一串连续的 Ctrl+P / Ctrl+N 里有效。
+  // 打字、方向键、翻页键、鼠标点击或切走焦点，都结束这一轮，下次上下以新位置为起点。
+  window.addEventListener('beforeinput', (e) => {
+    if (!goalEl) return;
+    if (/^(insert|delete)/.test(e.inputType || '')) resetGoal();
+  }, true);
+
+  window.addEventListener('click', () => resetGoal(), true);
+
+  // 选区被程序或鼠标改到别处（不是本脚本的上下移动造成的），也结束这一轮
+  window.addEventListener('selectionchange', () => {
+    if (!goalEl) return;
+    if (document.activeElement !== goalEl) resetGoal();
+  }, true);
+
+  window.addEventListener('keydown', (e) => {
+    if (!goalEl || e.isComposing) return;
+    if (e.ctrlKey && !e.altKey && !e.shiftKey && (e.code === 'KeyP' || e.code === 'KeyN')) return;
+    if (e.key.startsWith('Arrow') || e.key === 'Home' || e.key === 'End' ||
+        e.key === 'PageUp' || e.key === 'PageDown') resetGoal();
   }, true);
 })();
