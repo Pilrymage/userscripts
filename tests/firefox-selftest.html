@@ -20,7 +20,7 @@ h3 { margin: 8px 0 2px; font-size: 13px; }
 // @name         Readline 键位（网页输入框）
 // @namespace    https://github.com/Pilrymage/userscripts
 // @version      1.5.0
-// @description  在网页输入框 / textarea / contenteditable 中启用 Bash readline / Emacs 风格按键：Ctrl+A E P N F B K D（P/N 按视觉折行上下移动，与 ↑/↓ 一致），Ctrl+J 换行，Alt+F B D Backspace（中文按词，标点单独停），Alt+< > 跳到文本开头/结尾。
+// @description  在网页输入框 / textarea / contenteditable 中启用 Bash readline / Emacs 风格按键：Ctrl+A E P N F B K D（P/N 按视觉折行上下移动，落点对齐原生 ↑/↓），Ctrl+J 换行，Alt+F B D Backspace（中文按词，标点单独停），Alt+< > 跳到文本开头/结尾。
 // @author       Pilrymage
 // @license      MIT
 // @homepageURL  https://github.com/Pilrymage/userscripts
@@ -211,11 +211,6 @@ h3 { margin: 8px 0 2px; font-size: 13px; }
       const list = range.getClientRects();
       return list.length ? list[list.length - 1] : r;
     };
-    const glyphTop = (p) => {           // 该 offset 上字符字形所在行的 top；行尾返回 -1
-      if (p >= len || node.data.charCodeAt(p) === 10) return -1;
-      const r = boxOf(p, nextPos(node.data, p));
-      return r.height ? r.top - originY : -1;
-    };
 
     const rows = [];
     const at = new Map();
@@ -232,19 +227,16 @@ h3 { margin: 8px 0 2px; font-size: 13px; }
         x = r.left - originX;
       } else {
         // 行尾 / 硬换行处 / 文末
-        const prevChar = p > 0 ? node.data.charCodeAt(p - 1) : -1;
-        const prevIsNl = prevChar === 10;
-        if (prevIsNl) {
+        if (p > 0 && node.data.charCodeAt(p - 1) === 10) {
           // 硬换行之后：换行符所在行的下一行、行首
           const r = boxOf(p - 1, p);
           const nlTop = r.height ? r.top - originY : (current ? current.top : 0);
           top = nlTop + lineHeight;
           x = 0;
         } else if (p > 0) {
+          // 行尾：站在前一个字符的右边缘、与它同一行（p 恰在软折行处时也落回那一行）
           const r = boxOf(p - 1, p);
-          const prevTop = r.height ? r.top - originY : (current ? current.top : 0);
-          // 前一个字符若在更上面的行（说明 p 恰好在软折行处），行尾要落在它那一行
-          top = prevTop;
+          top = r.height ? r.top - originY : (current ? current.top : 0);
           x = r.right - originX;
         } else {
           const r = boxOf(0, 0);
@@ -265,6 +257,7 @@ h3 { margin: 8px 0 2px; font-size: 13px; }
     // 视觉行的「行尾」在原生里是下一行的第一个 offset，不是本行最后一个字符之后。
     // 例如等宽文本 0..30 | 31..61 里，第 0 行行尾是 31 而不是 30 的右侧。
     // 所以给非末行补一个「行尾」项：offset = 下一行的首项，x 取本行最后一个字符的右边缘。
+    // 这样「行尾按 ↑」会落在上一行的真实行尾，「行首按 ↓」也不会漏掉这一行的结尾。
     for (let i = 0; i < rows.length - 1; i++) {
       const row = rows[i];
       const nextRow = rows[i + 1];
@@ -301,7 +294,7 @@ h3 { margin: 8px 0 2px; font-size: 13px; }
     if (target >= rows.length) return el.value.length;
 
     const row = rows[target];
-    // 空行只有一个 caret，落到它上面（原生从空行再往上就是上一行行首，不用特殊处理）
+    // 空行只有一个 caret，落在它上面（再往上/下就是相邻行的行首，和原生一致）
     if (row.blank) return row.items[0].p;
 
     // 目标行里离目标列最近的 caret。
@@ -310,13 +303,15 @@ h3 { margin: 8px 0 2px; font-size: 13px; }
     const gx = Math.round(goal.x);
     let best = null, bestD = Infinity;
     for (const it of row.items) {
-      if (it.p === p) continue;              // 软折行的行尾别名就是自己，跳过，否则会原地不动
+      // 跳过自己：软折行点的 offset 同时是上一行的行尾和本行的行首，
+      // 不跳过的话从它按 ↑ 会原地不动。
+      if (it.p === p) continue;
       const d = Math.abs(Math.round(it.x) - gx);
       if (d < bestD) { bestD = d; best = it; }
     }
     if (best) return best.p;
 
-    // 目标行里只有它自己（软折行别名独占）：再走一行
+    // 极端情况：目标行除了自己没别的 caret（例如一行只有一个软折行点），再走一行
     const far = here.row + dir * 2;
     if (far < 0) return 0;
     if (far >= rows.length) return el.value.length;
@@ -329,8 +324,6 @@ h3 { margin: 8px 0 2px; font-size: 13px; }
   }
 
   function resetGoal() { goalX = null; goalEl = null; }
-
-
 
   // ---------- input / textarea ----------
   function moveTo(el, p) { el.setSelectionRange(p, p); }
@@ -503,6 +496,12 @@ h3 { margin: 8px 0 2px; font-size: 13px; }
   }, true);
 
   window.addEventListener('click', () => resetGoal(), true);
+
+  // 选区被程序或鼠标改到别处（不是本脚本的上下移动造成的），也结束这一轮
+  window.addEventListener('selectionchange', () => {
+    if (!goalEl) return;
+    if (document.activeElement !== goalEl) resetGoal();
+  }, true);
 
   window.addEventListener('keydown', (e) => {
     if (!goalEl || e.isComposing) return;

@@ -10,6 +10,23 @@ export const CHROME = process.env.CHROME_PATH ||
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// 每次运行都会新建一个几十 MB 的临时 profile。正常路径在 close() 里删，
+// 这里再兜一层：脚本崩了 / 被 Ctrl+C / 断言失败时也要清干净，
+// 否则反复跑测试会在 TEMP 里堆出一堆 rlk-cdp-* 目录。
+const LIVE = new Set();
+function cleanupAll() {
+  for (const d of LIVE) {
+    try { rmSync(d, { recursive: true, force: true }); } catch {}
+  }
+  LIVE.clear();
+}
+process.on('exit', cleanupAll);
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(sig, () => { cleanupAll(); process.exit(1); });
+}
+process.on('uncaughtException', (err) => { cleanupAll(); console.error(err); process.exit(1); });
+process.on('unhandledRejection', (err) => { cleanupAll(); console.error(err); process.exit(1); });
+
 async function waitFor(pred, ms = 20000) {
   const end = Date.now() + ms;
   while (Date.now() < end) {
@@ -47,6 +64,7 @@ class Cdp {
 export async function launch() {
   if (!existsSync(CHROME)) throw new Error('找不到 Chromium：' + CHROME);
   const dir = mkdtempSync(join(tmpdir(), 'rlk-cdp-'));
+  LIVE.add(dir);                        // 进程异常退出时由下面的钩子兜底清理
   const child = spawn(CHROME, [
     `--user-data-dir=${dir}`,
     '--remote-debugging-port=0',
@@ -153,9 +171,17 @@ export async function launch() {
 
     async close() {
       try { ws.close(); } catch {}
-      child.kill();
-      await sleep(150);
-      try { rmSync(dir, { recursive: true, force: true }); } catch {}
+      if (!child.killed) child.kill();
+      // 等 Chrome 真正退出再删，否则 profile 目录会被占用残留
+      await new Promise((resolve) => {
+        if (child.exitCode !== null) return resolve();
+        const t = setTimeout(resolve, 3000);
+        child.once('exit', () => { clearTimeout(t); resolve(); });
+      });
+      for (let i = 0; i < 5; i++) {
+        try { rmSync(dir, { recursive: true, force: true }); break; } catch { await sleep(150); }
+      }
+      LIVE.delete(dir);
     },
   };
 
