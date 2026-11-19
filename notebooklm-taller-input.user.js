@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         NotebookLM 输入框加高
 // @namespace    https://github.com/Pilrymage/userscripts
-// @version      2.3.0
-// @description  Firefox/Chromium 通用：输入框自动加高（40/60/80vh）、常用提示词菜单、对话区加宽、一键收起侧栏、复制时去掉引用角标、回答折叠（可被 Ctrl+F 搜到）。
+// @version      2.4.0
+// @description  Firefox/Chromium 通用：输入框自动加高（40/60/80vh）、常用提示词菜单、对话区加宽、一键收起侧栏、复制时去掉引用角标、回答折叠（可被 Ctrl+F 搜到）、右侧浮窗快速跳转历轮对话。
 // @author       Pilrymage
 // @license      MIT
 // @homepageURL  https://github.com/Pilrymage/userscripts
@@ -21,7 +21,7 @@
 
 (function () {
   'use strict';
-  const VERSION = '2.3.0';
+  const VERSION = '2.4.0';
   const TA = 'textarea.query-box-input'; // 不匹配左侧来源搜索框
   const STYLE_ID = 'nblm-taller-input-style';
   const HEIGHT_STEPS = [40, 60, 80];
@@ -82,6 +82,19 @@
   const foldChecked = new WeakSet();
   let answersPending = false;
 
+  // ---------- 右侧浮窗：快速跳转历轮对话 ----------
+  // DOM 结构参考 NotebookLM Chat Exporter（.to-user-container 同源）：
+  // div.chat-message-pair = 一轮问答，内含 .from-user-container（提问）/ .to-user-container（回答）。
+  // 老消息是滚到顶才懒加载的；「加载更早」照 exporter 的做法循环滚顶拉全，结束后弹回原位。
+  const PAIR = 'div.chat-message-pair';
+  const FROM_TEXT = '.from-user-container .message-text-content';
+  const K_JUMP_OPEN = 'nblm-taller-input.jump-open';
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  let jumpOpen = GM_getValue(K_JUMP_OPEN, false) === true;
+  let jumpQ = '', jumpNb = null, jumpPending = false, loadingEarlier = false;
+  const pairRows = new Map(); // chat-message-pair → { row, title, prev, full }
+  let pairSeq = [];
+
   const UI_CSS = `
 :host { --bg: #fff; --fg: #1f1f1f; --bd: #c4c7c5; --hover: #e9eef6; }
 @media (prefers-color-scheme: dark) { :host { --bg: #2b2c2f; --fg: #e3e3e3; --bd: #5f6368; --hover: #3c4043; } }
@@ -97,8 +110,45 @@
 .item:hover, .item:focus-visible { background: var(--hover); outline: none; }
 .toast { position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%); padding: 6px 14px; border-radius: 8px;
   background: var(--fg); color: var(--bg); font: 13px/1.4 system-ui, sans-serif; opacity: 0; transition: opacity .2s; pointer-events: none; }
-.toast.show { opacity: .92; }`;
+.toast.show { opacity: .92; }
+/* 右缘竖条 + 过往对话浮窗（仿 deepseek-harness 会话侧栏的卡片样式） */
+.jtab { position: fixed; right: 0; top: 45%; transform: translateY(-50%); writing-mode: vertical-rl;
+  padding: 12px 4px; border: 1px solid var(--bd); border-right: 0; border-radius: 8px 0 0 8px;
+  background: var(--bg); color: var(--fg); cursor: pointer; font: 12px/1.4 system-ui, sans-serif;
+  letter-spacing: 3px; opacity: .8; box-shadow: -1px 1px 4px rgba(0,0,0,.18); }
+.jtab:hover { opacity: 1; }
+.jpanel { position: fixed; top: 64px; right: 12px; width: min(340px, calc(100vw - 24px));
+  max-height: calc(100vh - 128px); display: flex; flex-direction: column; overflow: hidden;
+  border: 1px solid var(--bd); border-radius: 12px; background: var(--bg); box-shadow: 0 4px 24px rgba(0,0,0,.3); }
+.jhead { display: flex; align-items: center; gap: 6px; padding: 8px 8px 8px 12px;
+  border-bottom: 1px solid var(--bd); font: 13px/1.4 system-ui, sans-serif; color: var(--fg); }
+.jhead b { font-weight: 600; }
+.jcount { color: #80868b; font-size: 12px; }
+.jspacer { flex: 1; }
+.jmini { font: 12px/1.4 system-ui, sans-serif; color: var(--fg); cursor: pointer; white-space: nowrap;
+  border: 1px solid var(--bd); border-radius: 999px; padding: 2px 10px; background: transparent; }
+.jmini:hover { background: var(--hover); }
+.jmini:disabled { opacity: .5; cursor: default; }
+.jclose { font: 18px/1 system-ui, sans-serif; color: var(--fg); cursor: pointer; border: 0; padding: 0 6px; background: transparent; }
+.jclose:hover { color: #ea4335; }
+.jsearch { margin: 8px 10px 4px; width: calc(100% - 20px); box-sizing: border-box; padding: 5px 10px;
+  border: 1px solid var(--bd); border-radius: 8px; background: transparent; color: var(--fg);
+  font: 13px/1.4 system-ui, sans-serif; outline: none; }
+.jsearch:focus { border-color: #8ab4f8; }
+.jlist { flex: 1; overflow-y: auto; padding: 6px 4px; display: flex; flex-direction: column; gap: 2px; }
+.jrow { display: block; text-align: left; border: 0; padding: 7px 10px; border-radius: 8px;
+  background: transparent; color: inherit; cursor: pointer; }
+.jrow:hover, .jrow:focus-visible { background: var(--hover); outline: none; }
+.jtitle { font: 600 13px/1.45 system-ui, sans-serif; color: var(--fg); white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; }
+.jprev { font: 12px/1.5 system-ui, sans-serif; color: #5f6368; margin-top: 2px; display: -webkit-box;
+  -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+@media (prefers-color-scheme: dark) { .jprev { color: #9aa0a6; } }
+.jcur { box-shadow: inset 2px 0 0 #8ab4f8; }
+.jempty { padding: 16px; text-align: center; color: #80868b; font: 12px/1.5 system-ui, sans-serif; }
+.jtab[hidden], .jpanel[hidden], .jrow[hidden] { display: none; }`;
   let host, bar, sideBtn, promptBtn, menu, toastEl, toastTimer, lastInput = null, placePending = false;
+  let jtab, jpanel, jlist, jempty, jsearch, jcount, jloadBtn, jcloseBtn;
   let curPanel = null, addsPending = false;
   const touched = new WeakSet(); // 用户点过的输入框；没点过就追加到末尾而不是开头
   const widened = new Map();     // 被放宽的元素 → 原内联 max-width
@@ -137,6 +187,10 @@ ${ANSWER} { position: relative; }
 ${ANSWER}:hover > .nblm-fold-btn, .nblm-folded > .nblm-fold-btn { opacity: 1; }
 .nblm-folded ${ANSWER_BODY} { max-height: 4.5em !important; overflow: hidden !important; cursor: pointer;
   -webkit-mask-image: linear-gradient(#000 30%, transparent); mask-image: linear-gradient(#000 30%, transparent); }`;
+    // 浮窗跳转命中目标轮次时闪一下
+    text += `
+@keyframes nblm-jump-flash { from { background-color: rgba(138,180,248,.28); } to { background-color: transparent; } }
+.nblm-jump-flash { animation: nblm-jump-flash 1.2s ease-out 1; border-radius: 12px; }`;
     if (styleEl.textContent !== text) styleEl.textContent = text;
   }
 
@@ -282,13 +336,36 @@ ${ANSWER}:hover > .nblm-fold-btn, .nblm-folded > .nblm-fold-btn { opacity: 1; }
       item.addEventListener('click', () => { closeMenu(); insertPrompt(p.text); });
       menu.append(item);
     }
+    // 右缘竖条 + 过往对话浮窗
+    jtab = h('button', { className: 'jtab', type: 'button', title: '展开过往对话浮窗，点条目快速跳回那一轮',
+      textContent: '过往对话' });
+    jcount = h('span', { className: 'jcount', textContent: '0' });
+    jloadBtn = h('button', { className: 'jmini', type: 'button', textContent: '⟳ 加载更早',
+      title: '老消息是滚到顶才懒加载的：自动滚顶把更早的对话拉全，完成后弹回原位' });
+    jsearch = h('input', { className: 'jsearch', type: 'search', placeholder: '搜索过往对话…' });
+    jlist = h('div', { className: 'jlist' });
+    jempty = h('div', { className: 'jempty', textContent: '还没有对话', hidden: true });
+    jcloseBtn = h('button', { className: 'jclose', type: 'button', title: '关闭（Esc）', textContent: '×' });
+    jpanel = h('div', { className: 'jpanel', hidden: true },
+      h('div', { className: 'jhead' }, h('b', { textContent: '过往对话' }), jcount,
+        h('span', { className: 'jspacer' }), jloadBtn, jcloseBtn),
+      jsearch, jlist, jempty);
+    jtab.addEventListener('click', () => setJump(true));
+    jcloseBtn.addEventListener('click', () => setJump(false));
+    jloadBtn.addEventListener('click', loadEarlier);
+    jsearch.addEventListener('input', () => { jumpQ = jsearch.value; applyFilter(); });
     toastEl = h('div', { className: 'toast' });
-    root.append(h('style', { textContent: UI_CSS }), menu, bar, toastEl);
-    root.addEventListener('mousedown', e => e.preventDefault()); // 不抢焦点，保留输入框光标
+    root.append(h('style', { textContent: UI_CSS }), menu, bar, jtab, jpanel, toastEl);
+    // 不抢焦点，保留输入框光标；浮窗里的搜索框除外（它要拿到焦点才能打字）
+    root.addEventListener('mousedown', e => { if (!jpanel.contains(e.target)) e.preventDefault(); });
     sideBtn.addEventListener('click', toggleSides);
     promptBtn.addEventListener('click', () => (menu.hidden ? openMenu() : closeMenu()));
     document.addEventListener('mousedown', e => { if (!e.composedPath().includes(host)) closeMenu(); }, true);
-    document.addEventListener('keydown', e => { if (e.key === 'Escape' && !menu.hidden) closeMenu(); }, true);
+    document.addEventListener('keydown', e => {
+      if (e.key !== 'Escape' || e.isComposing) return;
+      if (!menu.hidden) closeMenu();
+      else if (!jpanel.hidden) setJump(false);
+    }, true);
     document.body.append(host);
   }
   function toast(msg) {
@@ -486,6 +563,127 @@ ${ANSWER}:hover > .nblm-fold-btn, .nblm-folded > .nblm-fold-btn { opacity: 1; }
     setFolded(body.closest(ANSWER), false);
   }, true);
 
+  // ===== 右侧浮窗：快速跳转历轮对话 =====
+  function extractRound(pair) {
+    const el = pair.querySelector(FROM_TEXT);
+    const lines = (el ? el.textContent : '').split('\n').map(s => s.trim()).filter(Boolean);
+    const title = lines[0] || '', rest = lines.slice(1).join(' ');
+    return { title: title ? title.slice(0, 80) : '（这一轮还没有文字）',
+      rest: rest.replace(/\s+/g, ' ').slice(0, 160),
+      full: (title + ' ' + rest).replace(/\s+/g, ' ').trim().toLowerCase() };
+  }
+  function makeRow(pair) {
+    const e = { row: h('button', { className: 'jrow', type: 'button' }),
+      title: h('div', { className: 'jtitle' }), prev: h('div', { className: 'jprev' }), full: '' };
+    e.row.append(e.title, e.prev);
+    e.row.addEventListener('click', () => { setJump(false); jumpTo(pair); });
+    pairRows.set(pair, e);
+    return e;
+  }
+  function fillRow(pair, e) {
+    const r = extractRound(pair);
+    e.title.textContent = r.title; e.prev.textContent = r.rest;
+    e.full = r.full; e.row.title = r.title; // 悬停可看完整首行
+  }
+  function applyFilter() {
+    const q = jumpQ.trim().toLowerCase();
+    let shown = 0;
+    for (const e of pairRows.values()) {
+      const hit = !q || (e.full || '').includes(q);
+      e.row.hidden = !hit; if (hit) shown++;
+    }
+    jempty.textContent = q ? '没有匹配的对话' : '还没有对话';
+    jempty.hidden = shown > 0;
+  }
+  function processJump() {
+    jumpPending = false;
+    buildUI(); if (!jlist) return;
+    const nb = nbId();
+    if (nb !== jumpNb) { // 换笔记本 / 离开：旧列表和搜索词都不作数
+      jumpNb = nb; pairRows.clear(); pairSeq = []; jlist.textContent = '';
+      jumpQ = ''; jsearch.value = '';
+    }
+    const pairs = [...document.querySelectorAll(PAIR)];
+    const inChat = pairs.length > 0 || !!document.querySelector('section.chat-panel');
+    jpanel.hidden = !jumpOpen || !inChat;
+    jtab.hidden = jumpOpen || !inChat;
+    let dirty = pairs.length !== pairRows.size;
+    if (!dirty) for (let i = 0; i < pairs.length; i++) if (pairSeq[i] !== pairs[i]) { dirty = true; break; }
+    if (dirty) {
+      const frag = document.createDocumentFragment(), seen = new Set();
+      for (const p of pairs) {
+        const e = pairRows.get(p) || makeRow(p);
+        if (!e.full) fillRow(p, e); // 提问文字可能此前还没渲染出来
+        frag.append(e.row); seen.add(p);
+      }
+      for (const p of pairRows.keys()) if (!seen.has(p)) pairRows.delete(p);
+      jlist.textContent = ''; jlist.append(frag);
+      pairSeq = pairs;
+    }
+    jcount.textContent = String(pairs.length);
+    applyFilter();
+  }
+  function queueJump() { if (!jumpPending) { jumpPending = true; setTimeout(processJump, 300); } }
+  function chatScroller() {
+    for (const sel of ['div.chat-panel-content', 'section.chat-panel', 'div.panel-container', 'div.app-body']) {
+      const c = document.querySelector(sel);
+      if (c && c.scrollHeight > c.clientHeight) return c;
+    }
+    return document.scrollingElement || document.documentElement;
+  }
+  function topPair() {
+    const top = chatScroller().getBoundingClientRect().top;
+    for (const p of document.querySelectorAll(PAIR)) {
+      if (p.getBoundingClientRect().bottom >= top + 4) return p;
+    }
+    return null;
+  }
+  function markCurrent() { // 当前视口顶部所在的一轮打标记，并把列表滚到它
+    for (const e of pairRows.values()) e.row.classList.remove('jcur');
+    const p = topPair(), e = p && pairRows.get(p);
+    if (e) { e.row.classList.add('jcur'); e.row.scrollIntoView({ block: 'center' }); }
+  }
+  function setJump(open) {
+    jumpOpen = open; GM_setValue(K_JUMP_OPEN, open);
+    processJump();
+    if (open && !jpanel.hidden) markCurrent();
+  }
+  function jumpTo(pair) {
+    if (!pair.isConnected) { toast('这一轮已经不在页面里了'); return; }
+    const sp = scrollParent(pair);
+    sp.scrollTo({ top: sp.scrollTop + pair.getBoundingClientRect().top - sp.getBoundingClientRect().top - 8,
+      behavior: 'smooth' });
+    pair.classList.remove('nblm-jump-flash');
+    void pair.offsetWidth; // 重置动画
+    pair.classList.add('nblm-jump-flash');
+    setTimeout(() => pair.classList.remove('nblm-jump-flash'), 1300);
+  }
+  async function loadEarlier() {
+    if (loadingEarlier) return;
+    loadingEarlier = true;
+    jloadBtn.disabled = true; jloadBtn.textContent = '加载中…';
+    const sp = chatScroller();
+    const anchor = topPair(), anchorTop = anchor ? anchor.getBoundingClientRect().top : 0;
+    const before = document.querySelectorAll(PAIR).length;
+    let height = sp.scrollHeight, count = before, idle = 0;
+    try {
+      for (let i = 0; i < 40 && idle < 2 && sp.isConnected; i++) {
+        sp.scrollTop = 0; // 触发懒加载
+        await sleep(700);
+        processJump(); // 列表实时补全
+        const h2 = sp.scrollHeight, n2 = document.querySelectorAll(PAIR).length;
+        if (h2 > height || n2 > count) { height = h2; count = n2; idle = 0; } else idle++;
+      }
+    } finally {
+      loadingEarlier = false;
+      jloadBtn.disabled = false; jloadBtn.textContent = '⟳ 加载更早';
+      if (anchor && anchor.isConnected) sp.scrollTop += anchor.getBoundingClientRect().top - anchorTop; // 弹回原位
+      else sp.scrollTop = sp.scrollHeight;
+      toast(count > before ? `已加载更早的 ${count - before} 轮对话` : '没有更早的对话了');
+      processJump();
+    }
+  }
+
   // ===== 事件与启动 =====
   document.addEventListener('input', e => {
     if (!e.target.matches?.(TA)) return;
@@ -507,7 +705,7 @@ ${ANSWER}:hover > .nblm-fold-btn, .nblm-folded > .nblm-fold-btn { opacity: 1; }
       if (!changed) changed = [...r.removedNodes].some(n => n.nodeType === 1);
     }
     if (!changed) return;
-    queueScan(); queuePlace(); queueAnswers();
+    queueScan(); queuePlace(); queueAnswers(); queueJump();
     if (!curPanel || !curPanel.isConnected) queueWidenAll(); else if (pendingAdds.size) queueAdds();
   });
   domObserver.observe(document, { childList: true, subtree: true });
@@ -515,6 +713,7 @@ ${ANSWER}:hover > .nblm-fold-btn, .nblm-folded > .nblm-fold-btn { opacity: 1; }
   queuePlace();
   queueWidenAll();
   queueAnswers();
+  if (jumpOpen) setJump(true);
 
   function probe() {
     return { version: VERSION, enabled: state.enabled, cap: cap(), prompts: promptsOn, cleanCopy: cleanOn,
@@ -522,6 +721,7 @@ ${ANSWER}:hover > .nblm-fold-btn, .nblm-folded > .nblm-fold-btn { opacity: 1; }
       sidePanels: sidePanels().map(p => p.section.className),
       folds: foldsOn, answers: document.querySelectorAll(ANSWER).length,
       foldedHere: document.querySelectorAll('.nblm-folded').length, savedHere: Object.keys(folds[nbId()] || {}).length,
+      jump: { open: jumpOpen, rounds: pairRows.size, loading: loadingEarlier, query: jumpQ },
       fieldSizingSupported: CSS.supports('field-sizing', 'content'),
       inputs: [...document.querySelectorAll(TA)].map(el => ({ height: el.clientHeight, scrollHeight: el.scrollHeight,
         overflow: getComputedStyle(el).overflowY, inlineHeight: el.style.height })) };
@@ -551,6 +751,7 @@ ${ANSWER}:hover > .nblm-fold-btn, .nblm-folded > .nblm-fold-btn { opacity: 1; }
       toast('干净复制：' + (cleanOn ? '启用' : '关闭'));
     });
     GM_registerMenuCommand('一键收起 / 展开侧栏', toggleSides);
+    GM_registerMenuCommand('右侧对话浮窗（跳转历轮对话）：显示 / 隐藏', () => setJump(!jumpOpen));
     GM_registerMenuCommand('回答折叠按钮：启用 / 关闭', () => {
       foldsOn = !foldsOn; GM_setValue(K_FOLD_ON, foldsOn); renderStyle();
       if (foldsOn) processAnswers(); else removeFoldUI();

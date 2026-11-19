@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>NotebookLM mock</title>
+<style>
+  body { margin: 0; font: 14px/1.5 system-ui, sans-serif; }
+  .chat-panel-content { height: 400px; overflow-y: auto; border: 1px solid #ccc; }
+  .chat-message-pair { border-bottom: 1px solid #eee; padding: 8px; }
+  .from-user-container .message-text-content { font-weight: 600; }
+  .to-user-container .message-text-content { color: #444; }
+</style>
+</head>
+<body>
+<section class="chat-panel">
+  <div class="chat-panel-content" id="chatbox"></div>
+  <form class="form"><textarea class="query-box-input" id="ta" rows="1"></textarea></form>
+</section>
+<script>
+  // 结构照 NotebookLM Chat Exporter 用的选择器：chat-message-pair 内含
+  // .from-user-container / .to-user-container，正文都在 .message-text-content 里。
+  function makePair(fromText, toText) {
+    const d = document.createElement('div');
+    d.className = 'chat-message-pair';
+    const f = document.createElement('div'); f.className = 'from-user-container';
+    const ft = document.createElement('div'); ft.className = 'message-text-content'; ft.textContent = fromText;
+    f.appendChild(ft);
+    const t = document.createElement('div'); t.className = 'to-user-container';
+    const tt = document.createElement('div'); tt.className = 'message-text-content'; tt.textContent = toText;
+    t.appendChild(tt);
+    d.append(f, t);
+    return d;
+  }
+  const box = document.getElementById('chatbox');
+  for (let i = 0; i < 6; i++) {
+    box.appendChild(makePair(`第${i + 1}问：这是提问 ${i}\n第二行预览文字 ${i}，用来核对灰色预览区`,
+      '回答内容 ' + 'y'.repeat(300)));
+  }
+  // 模拟懒加载：停在顶部时补一批更早的对话。真实 NotebookLM 是 IntersectionObserver
+  // 一类的“在顶部就继续加载”，这里用轮询模拟；默认关着，测试置 window.__lazyOn = true。
+  window.__loads = 0;
+  setInterval(() => {
+    if (!window.__lazyOn || window.__loads >= 2) return;
+    if (box.scrollTop !== 0) return;
+    window.__loads++;
+    for (let i = 0; i < 3; i++) {
+      box.prepend(makePair(`更早批次${window.__loads} 第${i}问：旧的提问\n旧提问的第二行 ${i}`,
+        '旧回答 ' + 'z'.repeat(300)));
+    }
+  }, 300);
+</script>
+</body>
+</html>

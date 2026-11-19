@@ -6,7 +6,7 @@
 |---|---|---|
 | Readline 键位 | 网页输入框里的 readline / Emacs 键：Ctrl+A E P N F B K D（**Ctrl+P / Ctrl+N 按视觉折行上下移动，落点对齐原生 ↑/↓**），Alt+F B 按词移动、Alt+D / Alt+Backspace 按词删除（中文分词，连续标点单独算一个停靠点）；Alt+< > 跳到开头/结尾；Ctrl+J 换行（不会触发发送）。Ctrl+K 和 Alt 删词的内容写入剪贴板 | [install](https://raw.githubusercontent.com/Pilrymage/userscripts/main/readline-keys.user.js) |
 | 图片屏蔽（文字优先） | 隔绝图片与视频封面，只留原尺寸虚线框和 alt 文字。全站默认开，Alt+Shift+I 一键全开本页，点击单张恢复原图，菜单里可按站点长期开关。拦 img / picture / video poster / CSS 背景，放过行内 SVG、canvas 和 .ico 图标 | [install](https://raw.githubusercontent.com/Pilrymage/userscripts/main/text-first-images.user.js) |
-| NotebookLM 输入框加高 | 加高输入框、提示词菜单、加宽对话区等 | [install](https://raw.githubusercontent.com/Pilrymage/userscripts/main/notebooklm-taller-input.user.js) |
+| NotebookLM 输入框加高 | 加高输入框、提示词菜单、加宽对话区、右侧浮窗快速跳转历轮对话（条目可搜索、一键拉全懒加载的更早消息）等 | [install](https://raw.githubusercontent.com/Pilrymage/userscripts/main/notebooklm-taller-input.user.js) |
 
 ## Firefox：释放 Ctrl+N
 
@@ -19,12 +19,13 @@ Ctrl+N（新建窗口）是 Firefox 的保留快捷键，网页拦不到。`fire
 
 ## 测试
 
-`tests/` 里是 Readline 键位的自动化测试，用本机 Chromium 通过 CDP 跑（不需要装 playwright/puppeteer）：
+`tests/` 里是 Readline 键位与 NotebookLM 右侧浮窗的自动化测试，用本机 Chromium 通过 CDP 跑（不需要装 playwright/puppeteer）：
 
 ```powershell
 node tests\visual-line.test.mjs   # 对照：Ctrl+P/N 落点 vs 原生 ↑/↓（逐位置采样）
 node tests\invariants.test.mjs    # 不变量：行首↓/行尾↑/可逆
 node tests\behavior.test.mjs      # 行为：连续上下、列保持、边界、单行 input、空内容
+node tests\notebooklm-jump.test.mjs  # 浮窗：列条目/搜索/跳转/懒加载拉全（mock NotebookLM DOM）
 ```
 
 Firefox 没有 CDP，用页面内自测代替：
