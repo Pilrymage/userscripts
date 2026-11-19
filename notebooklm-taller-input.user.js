@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         NotebookLM 输入框加高
 // @namespace    https://github.com/Pilrymage/userscripts
-// @version      2.4.0
-// @description  Firefox/Chromium 通用：输入框自动加高（40/60/80vh）、常用提示词菜单、对话区加宽、一键收起侧栏、复制时去掉引用角标、回答折叠（可被 Ctrl+F 搜到）、右侧浮窗快速跳转历轮对话。
+// @version      2.4.1
+// @description  Firefox/Chromium 通用：输入框自动加高（40/60/80vh）、常用提示词菜单、对话区加宽、一键收起侧栏、复制时去掉引用角标、回答折叠（可被 Ctrl+F 搜到）、右侧浮窗（默认常开，窄窗口自动收起）快速跳转历轮对话。
 // @author       Pilrymage
 // @license      MIT
 // @homepageURL  https://github.com/Pilrymage/userscripts
@@ -21,7 +21,7 @@
 
 (function () {
   'use strict';
-  const VERSION = '2.4.0';
+  const VERSION = '2.4.1';
   const TA = 'textarea.query-box-input'; // 不匹配左侧来源搜索框
   const STYLE_ID = 'nblm-taller-input-style';
   const HEIGHT_STEPS = [40, 60, 80];
@@ -88,9 +88,13 @@
   // 老消息是滚到顶才懒加载的；「加载更早」照 exporter 的做法循环滚顶拉全，结束后弹回原位。
   const PAIR = 'div.chat-message-pair';
   const FROM_TEXT = '.from-user-container .message-text-content';
-  const K_JUMP_OPEN = 'nblm-taller-input.jump-open';
+  // v2 起默认常开；换新键，避免沿用 2.4.0 保存过的关闭状态。
+  const K_JUMP_OPEN = 'nblm-taller-input.v2-jump-open';
+  const JUMP_MIN_W = 1000; // 窗口窄于此值自动收起浮窗（右缘竖条仍可手动展开）
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-  let jumpOpen = GM_getValue(K_JUMP_OPEN, false) === true;
+  let jumpOpen = GM_getValue(K_JUMP_OPEN, true) !== false;  // 用户意愿，默认开
+  let jumpNarrow = innerWidth < JUMP_MIN_W;                  // 宽度闸门：因窗口窄而收起（不持久化）
+  let jumpWideSeen = innerWidth >= JUMP_MIN_W;               // 上次检查时的宽度档位，用于检测跨越
   let jumpQ = '', jumpNb = null, jumpPending = false, loadingEarlier = false;
   const pairRows = new Map(); // chat-message-pair → { row, title, prev, full }
   let pairSeq = [];
@@ -350,7 +354,7 @@ ${ANSWER}:hover > .nblm-fold-btn, .nblm-folded > .nblm-fold-btn { opacity: 1; }
       h('div', { className: 'jhead' }, h('b', { textContent: '过往对话' }), jcount,
         h('span', { className: 'jspacer' }), jloadBtn, jcloseBtn),
       jsearch, jlist, jempty);
-    jtab.addEventListener('click', () => setJump(true));
+    jtab.addEventListener('click', openJump); // 竖条手动展开：一并解除宽度闸门
     jcloseBtn.addEventListener('click', () => setJump(false));
     jloadBtn.addEventListener('click', loadEarlier);
     jsearch.addEventListener('input', () => { jumpQ = jsearch.value; applyFilter(); });
@@ -605,8 +609,9 @@ ${ANSWER}:hover > .nblm-fold-btn, .nblm-folded > .nblm-fold-btn { opacity: 1; }
     }
     const pairs = [...document.querySelectorAll(PAIR)];
     const inChat = pairs.length > 0 || !!document.querySelector('section.chat-panel');
-    jpanel.hidden = !jumpOpen || !inChat;
-    jtab.hidden = jumpOpen || !inChat;
+    // 常开：用户开着且窗口够宽就显示；窄窗口自动收起，竖条仍可手动展开
+    jpanel.hidden = !jumpOpen || jumpNarrow || !inChat;
+    jtab.hidden = (jumpOpen && !jumpNarrow) || !inChat;
     let dirty = pairs.length !== pairRows.size;
     if (!dirty) for (let i = 0; i < pairs.length; i++) if (pairSeq[i] !== pairs[i]) { dirty = true; break; }
     if (dirty) {
@@ -647,6 +652,18 @@ ${ANSWER}:hover > .nblm-fold-btn, .nblm-folded > .nblm-fold-btn { opacity: 1; }
     jumpOpen = open; GM_setValue(K_JUMP_OPEN, open);
     processJump();
     if (open && !jpanel.hidden) markCurrent();
+  }
+  function openJump() { jumpNarrow = false; setJump(true); }
+  // 窗口宽度跨过阈值：变窄自动收起（toast 提示），变宽自动重新展开；
+  // 窄窗口下手动展开过的（jumpNarrow 已清）不会被同侧 resize 收回；手动 ×/Esc 关闭的优先。
+  function syncJumpWidth() {
+    const wide = innerWidth >= JUMP_MIN_W;
+    if (wide === jumpWideSeen) return;
+    jumpWideSeen = wide;
+    const wasShown = !!jpanel && !jpanel.hidden;
+    jumpNarrow = !wide;
+    processJump();
+    if (!wide && wasShown) toast('窗口变窄，浮窗已自动收起');
   }
   function jumpTo(pair) {
     if (!pair.isConnected) { toast('这一轮已经不在页面里了'); return; }
@@ -695,7 +712,7 @@ ${ANSWER}:hover > .nblm-fold-btn, .nblm-folded > .nblm-fold-btn { opacity: 1; }
     scan(); schedule(e.target);
     touched.add(e.target); lastInput = e.target; queuePlace();
   }, true);
-  window.addEventListener('resize', () => { bound.forEach((_, el) => schedule(el)); queuePlace(); });
+  window.addEventListener('resize', () => { bound.forEach((_, el) => schedule(el)); queuePlace(); syncJumpWidth(); });
   window.addEventListener('scroll', queuePlace, true);
   const domObserver = new MutationObserver(records => {
     let changed = false;
@@ -721,7 +738,7 @@ ${ANSWER}:hover > .nblm-fold-btn, .nblm-folded > .nblm-fold-btn { opacity: 1; }
       sidePanels: sidePanels().map(p => p.section.className),
       folds: foldsOn, answers: document.querySelectorAll(ANSWER).length,
       foldedHere: document.querySelectorAll('.nblm-folded').length, savedHere: Object.keys(folds[nbId()] || {}).length,
-      jump: { open: jumpOpen, rounds: pairRows.size, loading: loadingEarlier, query: jumpQ },
+      jump: { open: jumpOpen, narrow: jumpNarrow, rounds: pairRows.size, loading: loadingEarlier, query: jumpQ },
       fieldSizingSupported: CSS.supports('field-sizing', 'content'),
       inputs: [...document.querySelectorAll(TA)].map(el => ({ height: el.clientHeight, scrollHeight: el.scrollHeight,
         overflow: getComputedStyle(el).overflowY, inlineHeight: el.style.height })) };
@@ -751,7 +768,7 @@ ${ANSWER}:hover > .nblm-fold-btn, .nblm-folded > .nblm-fold-btn { opacity: 1; }
       toast('干净复制：' + (cleanOn ? '启用' : '关闭'));
     });
     GM_registerMenuCommand('一键收起 / 展开侧栏', toggleSides);
-    GM_registerMenuCommand('右侧对话浮窗（跳转历轮对话）：显示 / 隐藏', () => setJump(!jumpOpen));
+    GM_registerMenuCommand('右侧对话浮窗（跳转历轮对话）：显示 / 隐藏', () => { if (jumpOpen) setJump(false); else openJump(); });
     GM_registerMenuCommand('回答折叠按钮：启用 / 关闭', () => {
       foldsOn = !foldsOn; GM_setValue(K_FOLD_ON, foldsOn); renderStyle();
       if (foldsOn) processAnswers(); else removeFoldUI();
